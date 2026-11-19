@@ -1,0 +1,10 @@
+{
+  "fullname": "com.freakstudio.upystore",
+  "name": "uPyStore",
+  "publisher": "FreakStudio",
+  "version": "1.0.0",
+  "category": "appstore",
+  "short_description": "Browse, verify and install apps from upystore.io",
+  "activities": [{"classname": "UpyStoreActivity", "entrypoint": "assets/main.py", "intent_filters": [{"action": "main", "category": "launcher"}]}],
+  "services": []
+}
