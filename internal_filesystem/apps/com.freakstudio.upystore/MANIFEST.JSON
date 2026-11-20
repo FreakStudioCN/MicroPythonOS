@@ -1,0 +1,39 @@
+{
+  "name": "uPyStore",
+  "publisher": "FreakStudio",
+  "short_description": "uPyStore apps for MicroPythonOS",
+  "long_description": "Independent uPyStore client derived from the official MicroPythonOS AppStore. Browse, install and manage apps from upystore.io.",
+  "fullname": "com.freakstudio.upystore",
+  "version": "1.1.0",
+  "categories": [
+    "Appstore"
+  ],
+  "activities": [
+    {
+      "entrypoint": "upystore_app.py",
+      "classname": "UPyStore",
+      "intent_filters": [
+        {
+          "action": "main",
+          "category": "launcher"
+        },
+        {
+          "action": "com.freakstudio.upystore.updates",
+          "pathPattern": "upystore://updates"
+        }
+      ]
+    }
+  ],
+  "services": [
+    {
+      "entrypoint": "upystore_service.py",
+      "classname": "UPyStoreService",
+      "intent_filters": [
+        {
+          "action": "boot_completed",
+          "delay_s": 120
+        }
+      ]
+    }
+  ]
+}

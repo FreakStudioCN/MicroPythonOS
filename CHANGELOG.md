@@ -11,6 +11,9 @@ Frameworks:
 Builtin Apps:
 - Music Player: `.mp3` files are only offered in the file picker and only accepted when the firmware provides the `mp3dec` module, so updating the app on an older build does not offer files it cannot play; opening one anyway shows a clear message instead of an audio-device error.
 
+Apps:
+- uPyStore: add an independently installable client derived from the official AppStore, retaining its browsing and update-management UI while isolating the uPyStore backend, modules, preferences and notifications. Verify MPK integrity and launcher metadata before staged installation, invalidate old helper modules, and preserve notification routing to Updates.
+
 Testing:
 - mp3: frame-accurate streaming decoder tests over five generated fixtures (MPEG-1/2/2.5, CBR/VBR, mono/stereo, 8/22.05/44.1/48 kHz) that must give identical frame and sample totals for any feed chunk size, a CPython header/Xing/ID3 parser test checked against ffprobe, AudioManager `.mp3` routing tests, and `--file` support in the DAC acoustic check.
 - buzzer: acoustic verification from a host USB microphone — the badge plays a known note sequence and `scripts/mpos_buzzer_acoustic.py` segments the recording and folds each strongest spectral peak to the expected harmonic, so low notes work despite the piezo resonance; manual entry point `tests/manual_test_buzzer.py`, synthetic tests `tests/cpython_buzzer_acoustic.py`, and `MPOSController.buzzer_acoustic_measure/verify()`.

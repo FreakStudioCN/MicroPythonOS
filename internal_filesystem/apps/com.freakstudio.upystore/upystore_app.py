@@ -1,0 +1,1161 @@
+import gc
+import logging
+import time
+
+import lvgl as lv
+
+from mpos import Activity, App, AppManager, BuildInfo, DisplayMetrics, Intent, SettingsActivity, SharedPreferences, TaskManager
+from mpos.ui import QR_SYMBOL, STAR_SYMBOL
+from mpos.content import deeplink
+
+from upystore_detail import UPyStoreDetail
+import upystore_source
+from upystore_install import install_package, update_available
+from upystore_icons import blurhash_to_image_dsc, generate_raw_app_icon
+
+logger = logging.getLogger(__name__)
+
+
+class UPyStore(Activity):
+
+    _BADGEHUB_BASE_URL = 'https://badgehub.eu/api/v3'
+    _BADGEHUB_LIST_URL = f"https://badgehub.eu/api/v3/project-summaries?badge=mpos_api_{BuildInfo.version.api_level}"
+    _BADGEHUB_DETAILS_URL = 'https://badgehub.eu/api/v3/projects'
+
+    _ICON_SIZE = 64
+    _TOP_BAR_HEIGHT = 44
+    _TOP_BAR_BUTTON_SIZE = 34
+    _UPDATE_BUTTON_HEIGHT = 40
+
+    _GENERATE_APP_ICON_BENCHMARK = 11 # ms
+    _BLURHASH_APP_ICON_BENCHMARK = 76 # ms
+    _DOWNLOAD_ICON_INTERVAL = 3000 # ms between icon downloads
+    _ICON_TICK_MS = 250 # viewport icon loader period
+    _BLURHASH_PER_TICK = 1 # max blurhash decodes per loader tick
+    _RAW_PER_TICK = 4 # max raw icons generated per loader tick
+    _PRELOAD_VIEWPORTS = 1 # extra viewports of icons to preload above/below
+    _SETTLE_TICKS = 2 # quiet ticks after scrolling before icons resume
+
+    _STAGE_RANK = {'raw': 1, 'upystore_icons': 2, 'download': 3}
+    _DEFAULT_ICON_PIPELINE = 'upystore_icons'
+    _DEFAULT_HIDE_WIP = True
+    _SPECIAL_CATEGORIES = {'All', 'Work In Progress', 'Installed', 'Updates'}
+
+    apps = []
+    can_check_network = True
+
+    # Widgets:
+    main_screen = None
+    app_list = None
+    update_button = None
+    install_button = None
+    install_label = None
+    please_wait_label = None
+    progress_bar = None
+    settings_button = None
+    top_bar = None
+    category_dropdown = None
+    update_all_button = None
+    update_all_label = None
+    _update_labels = {}
+
+    def onCreate(self):
+        self.apps = []
+        self._destroyed = False
+        self.prefs = SharedPreferences(self.appFullName)
+        self._hide_wip = self.prefs.get_string('hide_wip', 'true') == 'true'
+        self._wip_apps = []
+        self._refresh_in_progress = False
+        self._data_loaded = False
+        self._icon_timer = None
+        self._displayed_apps = []
+        self._scroll_hold = False
+        self._last_scroll_y = None
+        self._stable_ticks = 0
+        self._download_in_progress = False
+        self._icon_pipeline = self.prefs.get_string('icon_pipeline', 'download' if upystore_source.current_source() == 'upystore' else self._DEFAULT_ICON_PIPELINE)
+        self.main_screen = lv.obj()
+        self.main_screen.remove_flag(lv.obj.FLAG.SCROLLABLE)
+
+        # ---- top bar ----
+        self.top_bar = lv.obj(self.main_screen)
+        self._apply_default_styles(self.top_bar)
+        self.top_bar.set_size(lv.pct(100), self._TOP_BAR_HEIGHT)
+        self.top_bar.align(lv.ALIGN.TOP_MID, 0, 0)
+        self.top_bar.set_style_bg_opa(lv.OPA.COVER, lv.PART.MAIN)
+        self.top_bar.set_style_border_width(1, lv.PART.MAIN)
+        self.top_bar.set_style_border_side(lv.BORDER_SIDE.BOTTOM, lv.PART.MAIN)
+
+        self.settings_button = lv.button(self.top_bar)
+        self.settings_button.set_size(self._TOP_BAR_BUTTON_SIZE, self._TOP_BAR_BUTTON_SIZE)
+        self.settings_button.align(lv.ALIGN.LEFT_MID, 5, 0)
+        self.settings_button.add_event_cb(self.settings_button_tap, lv.EVENT.CLICKED, None)
+        settings_label = lv.label(self.settings_button)
+        settings_label.set_text(lv.SYMBOL.SETTINGS)
+        settings_label.set_style_text_font(lv.font_montserrat_24, lv.PART.MAIN)
+        settings_label.center()
+
+        self.scanqr_button = lv.button(self.top_bar)
+        self.scanqr_button.set_size(self._TOP_BAR_BUTTON_SIZE, self._TOP_BAR_BUTTON_SIZE)
+        self.scanqr_button.align(lv.ALIGN.RIGHT_MID, -5, 0)
+        self.scanqr_button.add_event_cb(self.scanqr_button_tap, lv.EVENT.CLICKED, None)
+        scanqr_label = lv.label(self.scanqr_button)
+        scanqr_label.set_text(QR_SYMBOL)
+        scanqr_label.set_style_text_font(lv.font_montserrat_24, lv.PART.MAIN)
+        scanqr_label.center()
+
+        self.category_dropdown = lv.dropdown(self.top_bar)
+        self.category_dropdown.set_size(lv.pct(55), self._TOP_BAR_HEIGHT - 6)
+        self.category_dropdown.align_to(self.settings_button, lv.ALIGN.OUT_RIGHT_MID, 8, 0)
+        self.category_dropdown.set_options('All')
+        self.category_dropdown.add_event_cb(self._category_changed, lv.EVENT.VALUE_CHANGED, None)
+        self._category_options = ['All']
+        self._selected_category = self.getIntent().extras.get('category')
+        self._pending_deeplink = self.getIntent().extras.get('deeplink_fullname')
+        self._default_to_installed = self._selected_category is None and self._pending_deeplink is None
+
+        # ---- "Update N App(s)" button (hidden until updates are found) ----
+        self.update_all_button = lv.button(self.main_screen)
+        self.update_all_button.set_size(lv.pct(90), self._UPDATE_BUTTON_HEIGHT)
+        self.update_all_button.align(lv.ALIGN.TOP_MID, 0, self._TOP_BAR_HEIGHT + 4)
+        self.update_all_button.add_event_cb(self._update_all_click, lv.EVENT.CLICKED, None)
+        self.update_all_button.add_flag(lv.obj.FLAG.HIDDEN)
+        self.update_all_label = lv.label(self.update_all_button)
+        self.update_all_label.set_text('')
+        self.update_all_label.center()
+
+        # ---- please-wait / error label ----
+        self.please_wait_label = lv.label(self.main_screen)
+        self.please_wait_label.set_text('Downloading app index...')
+        self.please_wait_label.align(lv.ALIGN.CENTER, 0, self._TOP_BAR_HEIGHT // 2)
+        self.setContentView(self.main_screen)
+
+    def onResume(self, screen):
+        super().onResume(screen)
+
+        if getattr(self, '_pending_deeplink', None) and self._data_loaded and not self._refresh_in_progress and not getattr(self, '_catalog_error', False):
+            self._resolve_pending_deeplink()
+            return
+
+        # Attach to AppUpdateManager so the banner refreshes live
+        try:
+            from upystore_core import UPyStoreUpdateManager
+            um = UPyStoreUpdateManager.get_instance()
+            um.set_state_callback(self._on_update_state_change)
+            um.suppress_notifications = True
+            self._sync_update_banner(um.current_state, um.updatable_apps)
+        except Exception as e:
+            logger.warning('could not attach to AppUpdateManager: %s', e)
+
+        if not self._data_loaded or getattr(self, '_catalog_error', False):
+            self.refresh_list()
+        elif self._data_loaded and hasattr(self, 'apps_list') and self.apps_list:
+            self._stop_all_timers()
+            if self._sync_installed_state():
+                # An install or uninstall happened on the detail screen while
+                # this list was paused: rebuild it with the new state.
+                self.create_apps_list()
+                return
+            if self._icon_pipeline != 'none' and any(getattr(app, 'image_icon_widget', None) is None for app in self.apps):
+                # Rows were built while icons were disabled and have no icon
+                # slots: rebuild once with slots (the rebuild restarts the
+                # viewport icon loader as needed).
+                self.create_apps_list()
+                return
+            if self._icon_pipeline == 'none' and any(getattr(app, 'image_icon_widget', None) is not None for app in self.apps):
+                # Rows were built with icons: rebuild once without icon
+                # slots (full-width labels with side margins).
+                self.create_apps_list()
+                return
+            self._start_icon_timer()
+
+    def _sync_installed_state(self):
+        """Refresh the cached installed state after the detail screen changed it.
+
+        AppManager.uninstall_app() and download_and_install_package() both call
+        AppManager.refresh_apps(), which replaces the cache with new App
+        objects. The objects this list holds keep their old installed_path, so
+        an uninstalled app would stay in the Installed list (and an install
+        would not show up there). Returns True if anything changed.
+        """
+        changed = False
+        by_fullname = {app.fullname: app for app in AppManager.get_app_list()}
+        for app in self.apps:
+            current = by_fullname.get(app.fullname)
+            installed_path = current.installed_path if current is not None else None
+            if app.installed_path != installed_path:
+                app.installed_path = installed_path
+                changed = True
+        return changed
+
+    def onPause(self, screen):
+        self._stop_all_timers()
+        try:
+            from upystore_core import UPyStoreUpdateManager
+            UPyStoreUpdateManager.get_instance().clear_state_callback()
+            UPyStoreUpdateManager.get_instance().suppress_notifications = False
+        except Exception as e:
+            logger.warning('could not detach from AppUpdateManager: %s', e)
+        super().onPause(screen)
+
+    def onDestroy(self, screen):
+        self._has_foreground = False
+        self._destroyed = True
+        self._pending_deeplink = None
+        self._stop_all_timers()
+        widgets = getattr(self, '_icon_widgets', {})
+        for app in self.apps:
+            owned = widgets.get(app.fullname)
+            if owned is not None and getattr(app, 'image_icon_widget', None) is owned:
+                app.image_icon_widget = None
+        self._icon_widgets = {}
+        self._displayed_apps = []
+        self._update_labels = {}
+        for name in (
+            'main_screen', 'apps_list', 'app_list', 'please_wait_label', 'settings_button',
+            'top_bar', 'category_dropdown', 'update_all_button', 'update_all_label',
+        ):
+            setattr(self, name, None)
+        super().onDestroy(screen)
+
+    # ------------------------------------------------------------------
+    # Update-banner helpers
+    # ------------------------------------------------------------------
+
+    def _on_update_state_change(self, state):
+        # Invoked from the AppUpdateManager service loop thread: marshal the
+        # LVGL work to the main thread (LVGL is not thread-safe).
+        self.update_ui_threadsafe_if_foreground(self._apply_update_state_change, state)
+
+    def _apply_update_state_change(self, state):
+        try:
+            from upystore_core import UPyStoreUpdateManager
+            um = UPyStoreUpdateManager.get_instance()
+            self._sync_update_banner(state, um.updatable_apps)
+            if getattr(self, '_selected_category', None) == 'Updates' and getattr(self, '_data_loaded', False):
+                self.create_apps_list()
+        except Exception as e:
+            logger.warning('state change error: %s', e)
+
+    def _sync_update_banner(self, state, updatable_apps):
+        from upystore_core import UPyStoreUpdateState
+        if state == UPyStoreUpdateState.UPDATES_AVAILABLE and updatable_apps:
+            n = len(updatable_apps)
+            self.update_all_label.set_text(f"Update {n} App{'s' if n != 1 else ''}")
+            self.update_all_button.remove_flag(lv.obj.FLAG.HIDDEN)
+            # Push the list below the button
+            if hasattr(self, 'apps_list') and self.apps_list:
+                list_top = self._TOP_BAR_HEIGHT + self._UPDATE_BUTTON_HEIGHT + 8
+                self.apps_list.align(lv.ALIGN.TOP_LEFT, 0, list_top)
+                self.apps_list.set_height(lv.screen_active().get_height() - list_top)
+        else:
+            self.update_all_button.add_flag(lv.obj.FLAG.HIDDEN)
+            # Move the list back up
+            if hasattr(self, 'apps_list') and self.apps_list:
+                list_top = self._TOP_BAR_HEIGHT
+                self.apps_list.align(lv.ALIGN.TOP_LEFT, 0, list_top)
+                self.apps_list.set_height(lv.screen_active().get_height() - list_top)
+
+        # Show/hide per-app "Update available" labels
+        updatable_set = {a.get('fullname') for a in (updatable_apps or [])}
+        for fullname, label in self._update_labels.items():
+            if fullname in updatable_set:
+                label.remove_flag(lv.obj.FLAG.HIDDEN)
+            else:
+                label.add_flag(lv.obj.FLAG.HIDDEN)
+        if getattr(self, '_data_loaded', False):
+            self._update_category_dropdown()
+
+    def _update_all_click(self, event):
+        try:
+            from upystore_core import UPyStoreUpdateManager
+            updatable = UPyStoreUpdateManager.get_instance().updatable_apps
+        except Exception as e:
+            logger.warning('update all click error: %s', e)
+            return
+        if not updatable:
+            return
+        TaskManager.create_task(self._run_update_all(updatable))
+
+    async def _run_update_all(self, updatable_app_data_list):
+        'Sequentially download-and-install every app that has an update.'
+        if getattr(self, '_batch_updating', False):
+            return
+        self._batch_updating = True
+        try:
+            if self.has_foreground():
+                self.update_all_button.add_state(lv.STATE.DISABLED)
+            for app_data in updatable_app_data_list:
+                fullname = app_data.get('fullname')
+                if not fullname:
+                    continue
+                if not app_data.get('download_url'):
+                    if self.has_foreground():
+                        self.update_all_label.set_text(f"Checking {app_data.get('name', fullname)}...")
+                    try:
+                        details = await upystore_source.fetch_details(fullname, app_data.get('_store_slug'), app_data.get('_store_source'))
+                    except Exception as error:
+                        logger.warning('update details failed for %s: %s', fullname, error)
+                        continue
+                    if not details.get('download_url'):
+                        logger.warning('no download URL for %s', fullname)
+                        continue
+                    app_data['download_url'] = details['download_url']
+                    app_data['download_url_size'] = details.get('download_url_size')
+                if self.has_foreground():
+                    self.update_all_label.set_text(f"Updating {app_data.get('name', fullname)}...")
+                try:
+                    await install_package(app_data)
+                except Exception as error:
+                    logger.warning('update of %s failed: %s', fullname, error)
+                    if self.has_foreground():
+                        if 'Not enough' in str(error):
+                            self.update_all_label.set_text(f"Not enough space for {app_data.get('name', fullname)}")
+                        else:
+                            self.update_all_label.set_text(f"Update failed for {app_data.get('name', fullname)}")
+                    await TaskManager.sleep(1.5)
+
+        # Refresh everything after all updates
+        finally:
+            self._batch_updating = False
+            self._data_loaded = False
+            if self.has_foreground():
+                self.update_all_button.remove_state(lv.STATE.DISABLED)
+                self.apps.clear()
+                self.refresh_list()
+            try:
+                from upystore_core import UPyStoreUpdateManager
+                AppManager.refresh_apps()
+                UPyStoreUpdateManager.get_instance().check_for_updates_now()
+            except Exception as error:
+                logger.warning('post-update check error: %s', error)
+
+    # ------------------------------------------------------------------
+    # Existing AppStore methods (unchanged)
+    # ------------------------------------------------------------------
+
+    def refresh_list(self):
+        if self._refresh_in_progress:
+            if __debug__: logger.debug('refresh already in progress, skipping')
+            return
+        self._refresh_in_progress = True
+        TaskManager.create_task(self._download_app_index_wrapper(upystore_source.index_url()))
+
+    def settings_button_tap(self, event):
+        intent = Intent(activity_class=SettingsActivity)
+        intent.putExtra('prefs', self.prefs)
+        intent.putExtra('settings', [
+            {'title': 'Search Store', 'key': 'store_query', 'ui': 'textarea',
+             'default_value': '', 'changed_callback': self._store_source_changed},
+            {'title': 'App List Icons',
+             'key': 'icon_pipeline',
+             'ui': 'radiobuttons',
+             'default_value': self._icon_pipeline,
+             'ui_options': [
+                 ('None', 'none'),
+                 ('Blocky', 'raw'),
+                 ('Blocky, then blurhash', 'upystore_icons'),
+                 ('Blocky, blurhash, then download', 'download'),
+             ],
+             'changed_callback': self._icon_pipeline_changed},
+            {'title': "Hide 'Work in Progress' Apps",
+             'key': 'hide_wip',
+             'ui': 'radiobuttons',
+             'default_value': 'true',
+             'ui_options': [
+                 ('Hide', 'true'),
+                 ('Show', 'false'),
+             ],
+             'changed_callback': self._hide_wip_changed},
+            {'title': 'Update notifications',
+             'key': 'update_notifications',
+             'ui': 'radiobuttons',
+             'default_value': 'true',
+             'ui_options': [
+                 ('On', 'true'),
+                 ('Off', 'false'),
+             ],
+             'changed_callback': self._update_notifications_changed},
+        ])
+        self.startActivity(intent)
+
+    def _store_source_changed(self, value):
+        self._data_loaded = False
+
+    def _hide_wip_changed(self, new_value):
+        self._hide_wip = new_value == 'true'
+        self.refresh_list()
+
+    def _update_notifications_changed(self, new_value):
+        if new_value != 'true':
+            try:
+                from upystore_core import UPyStoreUpdateManager
+                UPyStoreUpdateManager.get_instance().clear_updates_notification()
+            except Exception as e:
+                logger.warning('could not clear update notification: %s', e)
+
+    def _category_changed(self, event):
+        if getattr(self, '_rebuilding_dropdown', False):
+            return
+        idx = self.category_dropdown.get_selected()
+        cat = self._category_options[idx]
+        self._selected_category = None if cat == 'All' else cat
+        self.create_apps_list()
+
+    def _update_category_dropdown(self):
+        if self.category_dropdown is None:
+            return
+        cat_counts = {}
+        total = 0
+        for app in self.apps:
+            for cat in app.categories:
+                cat_counts[cat] = cat_counts.get(cat, 0) + 1
+            total += 1
+        sorted_cats = [c for c in sorted(cat_counts.keys()) if c != 'Adult' and c not in UPyStore._SPECIAL_CATEGORIES]
+        top_cats = ['Installed', 'Updates']
+        if self._wip_apps:
+            top_cats.append('Work In Progress')
+        top_cats.append('All')
+        self._category_options = top_cats + sorted_cats
+        if 'Adult' in cat_counts:
+            self._category_options.append('Adult')
+        display = []
+        for cat_name in top_cats:
+            if cat_name == 'Installed':
+                n_installed = sum(1 for app in self.apps if app.installed_path is not None)
+                display.append('%s (%d)' % (cat_name, n_installed))
+            elif cat_name == 'Updates':
+                try:
+                    from upystore_core import UPyStoreUpdateManager
+                    n_updates = len(UPyStoreUpdateManager.get_instance().updatable_apps or [])
+                except Exception:
+                    n_updates = 0
+                display.append('%s (%d)' % (cat_name, n_updates))
+            elif cat_name == 'Work In Progress':
+                display.append('%s (%d)' % (cat_name, len(self._wip_apps)))
+            elif cat_name == 'All':
+                display.append('%s (%d)' % (cat_name, total))
+        for cat_name in sorted_cats:
+            display.append('%s (%d)' % (cat_name, cat_counts[cat_name]))
+        if 'Adult' in cat_counts:
+            display.append('Adult (%d)' % cat_counts['Adult'])
+        self._rebuilding_dropdown = True
+        self.category_dropdown.set_options("\n".join(display))
+        selected_cat = getattr(self, '_selected_category', None)
+        if selected_cat and selected_cat in self._category_options:
+            self.category_dropdown.set_selected(self._category_options.index(selected_cat))
+        elif selected_cat is None and 'All' in self._category_options:
+            self.category_dropdown.set_selected(self._category_options.index('All'))
+        else:
+            selected = self.category_dropdown.get_selected()
+            if selected < len(self._category_options):
+                self.category_dropdown.set_selected(selected)
+        self._rebuilding_dropdown = False
+
+    def _icon_pipeline_changed(self, new_value):
+        self._icon_pipeline = new_value
+        self._stop_all_timers()
+        self._download_in_progress = False
+        if new_value != 'none' and hasattr(self, 'apps_list') and self.apps_list:
+            if any(getattr(app, 'image_icon_widget', None) is None for app in self.apps):
+                # Rows were built while icons were disabled: onResume rebuilds
+                # them with icon slots when this activity is visible again.
+                return
+            self._start_icon_timer()
+
+    async def _download_app_index_wrapper(self, json_url):
+        signature = (json_url, self.prefs.get_string('store_query', ''))
+        try:
+            await self.download_app_index(json_url)
+        finally:
+            self._refresh_in_progress = False
+            if signature != (upystore_source.index_url(), self.prefs.get_string('store_query', '')):
+                self._data_loaded = False
+                if self.has_foreground():
+                    self.refresh_list()
+
+    async def download_app_index(self, json_url):
+        await TaskManager.sleep(0)
+        if __debug__:
+            _t_refresh = time.ticks_ms()
+
+        # Phase 1: always show installed apps first (no network needed)
+        if __debug__:
+            _t_phase1 = time.ticks_ms()
+        self.apps.clear()
+        self._wip_apps.clear()
+        self._builtin_fullnames = set()
+        for installed_app in AppManager.get_app_list():
+            if installed_app.installed_path and 'builtin' in installed_app.installed_path:
+                self._builtin_fullnames.add(installed_app.fullname)
+                continue
+            self.apps.append(self._copy_installed_app(installed_app))
+        if getattr(self, '_default_to_installed', False):
+            self._default_to_installed = False
+            n_installed = sum(1 for app in self.apps if app.installed_path is not None)
+            if n_installed > 0:
+                self._selected_category = 'Installed'
+        self._data_loaded = True
+        self.create_apps_list()
+        self._update_category_dropdown()
+        if __debug__:
+            _n_phase1 = len(self.apps)
+            logger.debug('appstore-perf: phase1 installed-apps list took=%dms n=%d', time.ticks_diff(time.ticks_ms(), _t_phase1), _n_phase1)
+
+        # A deep link to an app that is already known locally (e.g. installed)
+        # can open its detail screen right now, without waiting for the index
+        # download. Unknown apps keep waiting for Phase 2.
+        self._try_early_deeplink()
+
+        # Phase 2: download store index and merge in new apps
+        if __debug__:
+            _t_net = time.ticks_ms()
+        try:
+            response = await upystore_source.fetch_index(json_url)
+            self._catalog_error = False
+        except Exception as e:
+            if __debug__: logger.debug('store index unavailable (%s), showing installed apps only', e)
+            self._catalog_error = True
+            logger.warning('APPSTORE_CATALOG_FAILED %s %s', type(e).__name__, str(e))
+            if self.has_foreground():
+                self._show_scan_message('Store unavailable', '%s. Check WiFi and reopen the store to retry. Installed apps remain available.' % upystore_source.error_text(e)[:90])
+            self._resolve_pending_deeplink(index_available=False)
+            return
+        if getattr(self, '_destroyed', False):
+            return
+        if __debug__:
+            _net_took = time.ticks_diff(time.ticks_ms(), _t_net)
+            _net_bytes = len(response) if response is not None else -1
+            logger.debug('appstore-perf: phase2 network fetch took=%dms bytes=%d', _net_took, _net_bytes)
+            _t_parse = time.ticks_ms()
+        try:
+            parsed = response
+        except Exception as e:
+            logger.warning('could not parse store index: %s', e)
+            self._catalog_error = True
+            if self.has_foreground():
+                self._show_scan_message('Store unavailable', '%s. Check WiFi and reopen the store to retry. Installed apps remain available.' % upystore_source.error_text(e)[:90])
+            self._resolve_pending_deeplink(index_available=False)
+            return
+        if __debug__:
+            _n_parsed = len(parsed) if parsed is not None else -1
+            logger.debug('appstore-perf: phase2 json parse took=%dms entries=%d', time.ticks_diff(time.ticks_ms(), _t_parse), _n_parsed)
+            _t_merge = time.ticks_ms()
+
+        installed_by_fullname = {app.fullname: app for app in self.apps}
+        new_apps = []
+        for app_data in parsed:
+            try:
+                fullname = app_data.get('slug')
+                if not fullname:
+                    continue
+                if fullname in installed_by_fullname:
+                    existing = installed_by_fullname[fullname]
+                    upystore_source.attach(existing, app_data)
+                    if app_data.get('icon_map', {}).get('64x64', {}).get('url'):
+                        existing.icon_url = app_data['icon_map']['64x64']['url']
+                    store_version = app_data.get('version')
+                    if store_version:
+                        existing._remote_version = store_version
+                    ratings = app_data.get('ratings') or {}
+                    existing.rating_average = ratings.get('average')
+                    existing.rating_count = ratings.get('count', 0)
+                    if app_data.get('development_status') == 'work_in_progress':
+                        self._wip_apps.append(existing)
+                    continue
+                if fullname in self._builtin_fullnames:
+                    continue
+                app = UPyStore.badgehub_app_to_mpos_app(app_data)
+                if app_data.get('development_status') == 'work_in_progress':
+                    self._wip_apps.append(app)
+                    if self._hide_wip:
+                        continue
+                new_apps.append(app)
+            except Exception as e:
+                logger.warning('could not process store app %s: %s', app_data.get('slug', '?'), e)
+        if __debug__:
+            logger.debug('appstore-perf: phase2 merge took=%dms new=%d wip=%d', time.ticks_diff(time.ticks_ms(), _t_merge), len(new_apps), len(self._wip_apps))
+
+        parsed = None
+        response = None
+        gc.collect()
+
+        # Merge new apps in memory (sorted once) and build the visible list
+        # exactly once below. Per-app widget insertion here would only be
+        # deleted again by the mandatory full rebuild for rating labels.
+        # If the activity is no longer in the foreground (e.g. test called
+        # back_screen() while the download was in flight), skip the rebuild:
+        # acting on deleted LVGL objects can segfault the device.
+        if not self.has_foreground():
+            self._data_loaded = False
+            self._resolve_pending_deeplink()
+            return
+        if __debug__:
+            _t_merge_apps = time.ticks_ms()
+        if new_apps:
+            self.apps.extend(new_apps)
+            keyed = [(self._sort_key(a.name), a) for a in self.apps]
+            keyed.sort(key=lambda t: t[0])
+            self.apps = [a for _, a in keyed]
+        if __debug__:
+            logger.debug('appstore-perf: phase2 sort took=%dms n=%d', time.ticks_diff(time.ticks_ms(), _t_merge_apps), len(new_apps))
+
+        # ponytail: rebuild whole list so installed apps get their rating labels
+        # (ratings were patched after Phase 1 already painted the list)
+        if self.has_foreground():
+            if __debug__:
+                _t_rebuild = time.ticks_ms()
+            self.create_apps_list()
+            if __debug__:
+                logger.debug('appstore-perf: phase2 full rebuild took=%dms', time.ticks_diff(time.ticks_ms(), _t_rebuild))
+                _t_dropdown = time.ticks_ms()
+            self._update_category_dropdown()
+            if __debug__:
+                logger.debug('appstore-perf: phase2 dropdown took=%dms', time.ticks_diff(time.ticks_ms(), _t_dropdown))
+        self._resolve_pending_deeplink()
+        if __debug__:
+            logger.debug('appstore-perf: refresh total took=%dms apps=%d', time.ticks_diff(time.ticks_ms(), _t_refresh), len(self.apps))
+
+    def create_apps_list(self):
+        if __debug__: logger.debug('create_apps_list')
+        # Guard against being called after the activity was removed (e.g. async
+        # download completing after back_screen). Acting on deleted LVGL objects
+        # can hard-fault the device.
+        if not getattr(self, 'main_screen', None) or not self.has_foreground():
+            if __debug__: logger.debug('create_apps_list skipped: not in foreground')
+            return
+
+        self._stop_all_timers()
+        self._download_in_progress = False
+
+        if __debug__: logger.debug('hiding please wait label')
+        try:
+            self.please_wait_label.add_flag(lv.obj.FLAG.HIDDEN)
+        except Exception:
+            return
+
+        # Determine top offset (update button may be visible)
+        button_visible = not self.update_all_button.has_flag(lv.obj.FLAG.HIDDEN)
+        list_top = self._TOP_BAR_HEIGHT + (self._UPDATE_BUTTON_HEIGHT + 8 if button_visible else 0)
+        list_h = lv.screen_active().get_height() - list_top
+
+        if hasattr(self, 'apps_list') and self.apps_list:
+            for app in self.apps:
+                app.image_icon_widget = None
+            self.apps_list.delete()
+        self.apps_list = lv.list(self.main_screen)
+        self.apps_list.add_event_cb(self._on_list_scroll, lv.EVENT.SCROLL_BEGIN, None)
+        self.apps_list.add_event_cb(self._on_list_scroll, lv.EVENT.SCROLL_END, None)
+        self._apply_default_styles(self.apps_list)
+        self.apps_list.set_size(lv.pct(100), list_h)
+        self.apps_list.align(lv.ALIGN.TOP_LEFT, 0, list_top)
+        self._icon_widgets = {}
+        self._update_labels = {}
+        self._displayed_apps = []
+        if __debug__: logger.debug('create_apps_list iterating')
+        if __debug__:
+            _t_rows = time.ticks_ms()
+            _n_rows = 0
+        sel_cat = getattr(self, '_selected_category', None)
+        apps_to_show = self._wip_apps if sel_cat == 'Work In Progress' else self.apps
+        installed_set = set()
+        if sel_cat == 'Installed':
+            installed_set = {app.fullname for app in self.apps if app.installed_path is not None}
+        if sel_cat == 'Updates':
+            try:
+                from upystore_core import UPyStoreUpdateManager
+                updatable_set = {a.get('fullname') for a in (UPyStoreUpdateManager.get_instance().updatable_apps or [])}
+            except Exception:
+                updatable_set = set()
+        for app in apps_to_show:
+            if sel_cat:
+                if sel_cat == 'Work In Progress':
+                    pass
+                elif sel_cat == 'Installed':
+                    if app.fullname not in installed_set:
+                        continue
+                elif sel_cat == 'Updates':
+                    if app.fullname not in updatable_set:
+                        continue
+                elif not app.categories or sel_cat not in app.categories:
+                    continue
+            # Row-op micro-profile: time each build segment for the first and
+            # sixth built rows (cold vs warmed-up caches). Row count comes
+            # from _n_rows, incremented at the end of the loop body.
+            if __debug__:
+                _prof = (_n_rows == 0 or _n_rows == 5)
+                _pt = time.ticks_ms()
+            item = self.apps_list.add_button(None, '')
+            item.set_style_pad_all(0, lv.PART.MAIN)
+            item.set_size(lv.pct(100), lv.SIZE_CONTENT)
+            item.set_flex_flow(lv.FLEX_FLOW.ROW)
+            self._add_click_handler(item, self.show_app_detail, app)
+            # add_button() always creates an empty auto label child (see
+            # lv_list_add_button in lvgl lv_list.c). As a ROW flex item with
+            # flex_grow 1 it would eat all free space, so remove it. With
+            # icon=None it is child 0: nothing else was added yet.
+            if item.get_child_count() > 0:
+                item.get_child(0).delete()
+            if __debug__ and _prof:
+                logger.debug('appstore-perf: row%d button took=%dms', _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
+            if self._icon_pipeline == 'none':
+                app.image_icon_widget = None
+                item.set_style_pad_hor(DisplayMetrics.pct_of_width(4), lv.PART.MAIN)
+            else:
+                icon_spacer = lv.image(item)
+                icon_spacer.set_size(self._ICON_SIZE, self._ICON_SIZE)
+                app.image_icon_widget = icon_spacer
+                self._icon_widgets[app.fullname] = icon_spacer
+                if app.icon_data:
+                    self._set_icon_widget(app)
+                elif self._restore_cached_icon(app, icon_spacer):
+                    pass
+                # Otherwise the viewport icon loader fills the slot in when
+                # the row scrolls into view.
+            self._displayed_apps.append(app)
+            if __debug__ and _prof:
+                logger.debug('appstore-perf: row%d icon took=%dms', _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
+            label_cont = lv.obj(item)
+            self._apply_default_styles(label_cont)
+            label_cont.set_flex_flow(lv.FLEX_FLOW.COLUMN)
+            label_cont.set_style_pad_ver(10, lv.PART.MAIN)
+            label_cont.set_size(lv.pct(100 if self._icon_pipeline == 'none' else 75), lv.SIZE_CONTENT)
+            # Every lv.obj is CLICKABLE by default (see lv_obj_init in lvgl
+            # lv_obj.c), so row taps land on these containers. The single
+            # CLICKED handler on the item covers the whole row only if the
+            # containers let the event bubble up to it.
+            label_cont.add_flag(lv.obj.FLAG.EVENT_BUBBLE)
+            name_row = lv.obj(label_cont)
+            self._apply_default_styles(name_row)
+            name_row.set_flex_flow(lv.FLEX_FLOW.ROW)
+            name_row.set_size(lv.pct(100), lv.SIZE_CONTENT)
+            name_row.add_flag(lv.obj.FLAG.EVENT_BUBBLE)
+            if __debug__ and _prof:
+                logger.debug('appstore-perf: row%d containers took=%dms', _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
+            name_label = lv.label(name_row)
+            name_label.set_text(app.name)
+            name_label.set_style_text_font(lv.font_montserrat_16, lv.PART.MAIN)
+            name_label.set_flex_grow(1)
+            rating_avg = getattr(app, 'rating_average', None)
+            if rating_avg is not None and rating_avg > 0:
+                rating_label = lv.label(name_row)
+                rating_label.set_text('%s %.1f' % (STAR_SYMBOL, rating_avg))
+                rating_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
+                rating_label.set_size(lv.SIZE_CONTENT, lv.SIZE_CONTENT)
+            if __debug__ and _prof:
+                logger.debug('appstore-perf: row%d name took=%dms', _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+                _pt = time.ticks_ms()
+            desc_label = lv.label(label_cont)
+            desc_label.set_text(app.short_description)
+            desc_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
+            update_label = lv.label(label_cont)
+            update_label.set_text('Update available')
+            update_label.set_style_text_font(lv.font_montserrat_12, lv.PART.MAIN)
+            update_label.set_style_text_color(lv.palette_main(lv.PALETTE.GREEN), lv.PART.MAIN)
+            update_label.add_flag(lv.obj.FLAG.HIDDEN)
+            self._update_labels[app.fullname] = update_label
+            if __debug__ and _prof:
+                logger.debug('appstore-perf: row%d desc_update took=%dms', _n_rows, time.ticks_diff(time.ticks_ms(), _pt))
+            if __debug__:
+                _n_rows += 1
+                if _n_rows % 20 == 0:
+                    logger.debug('appstore-perf: create_apps_list progress rows=%d took=%dms', _n_rows, time.ticks_diff(time.ticks_ms(), _t_rows))
+        if __debug__:
+            logger.debug('appstore-perf: create_apps_list rows took=%dms rows=%d', time.ticks_diff(time.ticks_ms(), _t_rows), _n_rows)
+        if self._icon_pipeline != 'none':
+            self._start_icon_timer()
+        if __debug__:
+            _t_updates = time.ticks_ms()
+        try:
+            from upystore_core import UPyStoreUpdateManager, UPyStoreUpdateState
+            updatable = []
+            for app in self.apps:
+                installed_path = getattr(app, 'installed_path', None)
+                if not installed_path:
+                    continue
+                remote = getattr(app, '_remote_version', None)
+                if not remote:
+                    continue
+                if update_available(app.fullname, remote, getattr(app, 'revision', None), getattr(app, '_store_source', None)):
+                    updatable.append({
+                        'fullname': app.fullname,
+                        'version': remote,
+                        'name': app.name,
+                        'download_url': app.download_url,
+                        '_store_source': getattr(app, '_store_source', upystore_source.current_source()),
+                        '_store_slug': getattr(app, '_store_slug', None),
+                        'revision': getattr(app, 'revision', None),
+                    })
+            UPyStoreUpdateManager.get_instance().updatable_apps = updatable
+            if updatable:
+                UPyStoreUpdateManager.get_instance().current_state = UPyStoreUpdateState.UPDATES_AVAILABLE
+            state = UPyStoreUpdateState.UPDATES_AVAILABLE if updatable else UPyStoreUpdateState.NO_UPDATES
+            self._sync_update_banner(state, updatable)
+        except Exception:
+            pass
+        if __debug__:
+            logger.debug('appstore-perf: create_apps_list update-check took=%dms', time.ticks_diff(time.ticks_ms(), _t_updates))
+        if __debug__: logger.debug('create_apps_list done')
+
+    _SORT_STRIP = '!"\'?:;.,@#$%^&*()-_=+[]{}\\|`~<>/'
+
+    def _sort_key(self, name):
+        return name.lstrip(self._SORT_STRIP).lower()
+
+    def _stop_all_timers(self):
+        if getattr(self, '_icon_timer', None):
+            self._icon_timer.delete()
+            self._icon_timer = None
+
+    def _start_icon_timer(self):
+        self._stop_all_timers()
+        if self._icon_pipeline == 'none':
+            return
+        if not getattr(self, 'apps_list', None):
+            return
+        try:
+            self._load_viewport_icons(None)
+        except Exception as e:
+            logger.warning('initial icon load error: %s', e)
+        try:
+            self._icon_timer = self._create_timer(self._load_viewport_icons, self._ICON_TICK_MS)
+        except Exception as e:
+            logger.warning('could not start icon timer: %s', e)
+
+    def _create_timer(self, callback, period_ms):
+        return lv.timer_create(callback, period_ms, None)
+
+    def _visible_apps(self):
+        displayed = getattr(self, '_displayed_apps', None) or []
+        try:
+            self.apps_list.update_layout()
+            scroll_y = self.apps_list.get_scroll_y()
+            list_h = self.apps_list.get_height()
+        except Exception:
+            return list(displayed)
+        try:
+            margin = list_h * self._PRELOAD_VIEWPORTS
+            lo = scroll_y - margin
+            hi = scroll_y + list_h + margin
+            visible = []
+            n = self.apps_list.get_child_count()
+            for i in range(n):
+                if i >= len(displayed):
+                    break
+                try:
+                    row = self.apps_list.get_child(i)
+                    y = row.get_y()
+                    h = row.get_height()
+                except Exception:
+                    continue
+                if y + h > lo and y < hi:
+                    visible.append(displayed[i])
+            return visible
+        except Exception:
+            return list(displayed)
+
+    def _on_list_scroll(self, event):
+        code = event.get_code()
+        if code == lv.EVENT.SCROLL_BEGIN:
+            self._scroll_hold = True
+        elif code == lv.EVENT.SCROLL_END:
+            self._scroll_hold = False
+            self._stable_ticks = 0
+
+    def _scrolling_now(self):
+        try:
+            cur = self.apps_list.get_scroll_y()
+        except Exception:
+            return False
+        last = getattr(self, '_last_scroll_y', None)
+        self._last_scroll_y = cur
+        if last is None or cur is None:
+            self._stable_ticks = self._SETTLE_TICKS
+            return False
+        if getattr(self, '_scroll_hold', False) or cur != last:
+            self._stable_ticks = 0
+            if cur == last:
+                self._scroll_hold = False
+            return True
+        stable = getattr(self, '_stable_ticks', 0)
+        if stable < self._SETTLE_TICKS:
+            self._stable_ticks = stable + 1
+            return True
+        return False
+
+    def _load_viewport_icons(self, timer):
+        if self._icon_pipeline == 'none':
+            return
+        if not getattr(self, 'apps_list', None):
+            return
+        if not self.has_foreground():
+            return
+        if self._scrolling_now():
+            return
+        try:
+            visible = self._visible_apps()
+        except Exception:
+            return
+        if not visible:
+            return
+        target = self._STAGE_RANK.get(self._icon_pipeline, 1)
+        blurhash_left = self._BLURHASH_PER_TICK
+        raw_left = self._RAW_PER_TICK
+        for app in visible:
+            try:
+                blurhash_left, raw_left = self._load_one_icon(app, target, blurhash_left, raw_left)
+            except Exception as e:
+                if __debug__: logger.debug('icon load skipped for %s: %s', getattr(app, 'fullname', '?'), e)
+
+    def _load_one_icon(self, app, target, blurhash_left, raw_left):
+        widget = getattr(app, 'image_icon_widget', None)
+        if not widget:
+            return blurhash_left, raw_left
+        stage = getattr(app, '_icon_stage', None)
+        if stage == 'download' or (target == 2 and stage == 'upystore_icons') or (target == 1 and stage == 'raw'):
+            return blurhash_left, raw_left
+        if app.icon_data:
+            self._set_icon_widget(app)
+            return blurhash_left, raw_left
+        if stage is None:
+            if self._restore_cached_icon(app, widget):
+                return blurhash_left, raw_left
+            if raw_left <= 0:
+                return blurhash_left, raw_left
+            self._set_raw_icon(app)
+            return blurhash_left, raw_left - 1
+        if target >= 2 and app.blur_hash and stage == 'raw':
+            if blurhash_left <= 0:
+                return blurhash_left, raw_left
+            blurhash_left -= 1
+            dsc, buf = blurhash_to_image_dsc(app.blur_hash, 16, 16)
+            if dsc is not None:
+                app._icon_dsc = dsc
+                app._icon_buf = buf
+                app._icon_stage = 'upystore_icons'
+                widget = getattr(app, 'image_icon_widget', None)
+                if widget:
+                    try:
+                        widget.set_src(dsc)
+                        widget.set_scale(4 * 256)
+                    except Exception:
+                        pass
+            return blurhash_left, raw_left
+        if target >= 3 and app.icon_url and not app.icon_data:
+            if self._download_in_progress:
+                return blurhash_left, raw_left
+            self._download_in_progress = True
+            TaskManager.create_task(self._do_download(app))
+        return blurhash_left, raw_left
+
+    def _set_raw_icon(self, app):
+        try:
+            widget = app.image_icon_widget
+        except Exception as e:
+            if __debug__: logger.debug('no icon widget for %s: %s', app.fullname, e)
+            return
+        if not widget:
+            return
+        dsc, buf = generate_raw_app_icon(app.fullname, UPyStore._ICON_SIZE)
+        app._icon_dsc = dsc
+        app._icon_buf = buf
+        app._icon_stage = 'raw'
+        widget.set_src(dsc)
+        widget.set_scale(256)
+
+    async def _do_download(self, app):
+        try:
+            app.icon_data = await upystore_source.request(app.icon_url, timeout=10)
+        except Exception:
+            pass
+        self._download_in_progress = False
+        if app.icon_data and self.has_foreground():
+            try:
+                self._set_icon_widget(app)
+            except Exception:
+                pass
+
+    def _restore_cached_icon(self, app, widget):
+        if hasattr(app, '_icon_dsc') and app._icon_dsc is not None:
+            dsc = app._icon_dsc
+            if app.icon_data:
+                app._icon_stage = 'download'
+                scale = 256
+            elif dsc.header.w == self._ICON_SIZE:
+                app._icon_stage = 'raw'
+                scale = 256
+            else:
+                app._icon_stage = 'upystore_icons'
+                scale = 4 * 256
+            widget.set_src(dsc)
+            widget.set_scale(scale)
+            return True
+        return False
+
+    def _set_icon_widget(self, app):
+        try:
+            widget = app.image_icon_widget
+        except Exception as e:
+            if __debug__: logger.debug('no icon widget for %s: %s', app.fullname, e)
+            return
+        if not widget:
+            return
+        if app.icon_data:
+            dsc = lv.image_dsc_t({
+                'data_size': len(app.icon_data),
+                'data': app.icon_data
+            })
+            scale = 256
+            buf = None
+            app._icon_stage = 'download'
+        else:
+            dsc, buf = blurhash_to_image_dsc(app.blur_hash, 16, 16)
+            if dsc is None:
+                dsc, buf = generate_raw_app_icon(app.fullname, UPyStore._ICON_SIZE)
+                scale = 256
+                app._icon_stage = 'raw'
+            else:
+                scale = 4 * 256
+                app._icon_stage = 'upystore_icons'
+        app._icon_dsc = dsc
+        app._icon_buf = buf
+        widget.set_src(dsc)
+        widget.set_scale(scale)
+
+    def show_app_detail(self, app):
+        intent = Intent(activity_class=UPyStoreDetail)
+        intent.putExtra('app', app)
+        intent.putExtra('upystore_app', self)
+        self.startActivity(intent)
+
+    # ------------------------------------------------------------------
+    # QR scanning and deep links
+    # ------------------------------------------------------------------
+
+    def scanqr_button_tap(self, event):
+        from mpos.ui.camera_activity import CameraActivity
+        self.startActivityForResult(
+            Intent(activity_class=CameraActivity).putExtra('scanqr_intent', True),
+            self.scanqr_result_callback,
+        )
+
+    def scanqr_result_callback(self, result):
+        if not isinstance(result, dict) or not result.get('result_code'):
+            return
+        data = result.get('data')
+        link = deeplink.parse_store_link(data)
+        if link:
+            self.open_app_by_fullname(link['fullname'])
+            return
+        # Not a store link: offer it to third-party URL handlers.
+        if isinstance(data, str) and deeplink.open_url(data):
+            return
+        preview = data if isinstance(data, str) else repr(data)
+        if len(preview) > 128:
+            preview = preview[:128] + '...'
+        self._show_scan_message('Not an app link', "This QR code is not a MicroPythonOS app link:\n\n%s" % preview)
+
+    def open_app_by_fullname(self, fullname):
+        'Open the detail screen for a store app, refreshing the index if needed.'
+        app = self._find_store_app(fullname)
+        if app:
+            self.show_app_detail(app)
+            return
+        self._pending_deeplink = fullname
+        if self._data_loaded and not self._refresh_in_progress:
+            self.refresh_list()
+        # Otherwise the index download is already underway and
+        # _resolve_pending_deeplink() will run when it finishes.
+
+    def _find_store_app(self, fullname):
+        for app in self.apps:
+            if app.fullname == fullname:
+                return app
+        for app in self._wip_apps:
+            if app.fullname == fullname:
+                return app
+        return None
+
+    def _try_early_deeplink(self):
+        'Open a pending deep link now if the app is already resolvable.'
+        if not self.has_foreground():
+            return
+        fullname = getattr(self, '_pending_deeplink', None)
+        if not fullname:
+            return
+        app = self._find_store_app(fullname)
+        if app:
+            self._pending_deeplink = None
+            self.show_app_detail(app)
+
+    def _resolve_pending_deeplink(self, index_available=True):
+        if not self.has_foreground():
+            return
+        fullname = getattr(self, '_pending_deeplink', None)
+        if not fullname:
+            return
+        self._pending_deeplink = None
+        app = self._find_store_app(fullname)
+        if app:
+            self.show_app_detail(app)
+        elif not index_available:
+            self._show_scan_message('No connection',
+                                    "Could not download the app index to look up '%s'.\nCheck your network connection and try again." % fullname)
+        else:
+            self._show_scan_message('App not found',
+                                    "App '%s' is not in the App Store.\nIt may have been removed, or your device may need a system update." % fullname)
+
+    def _show_scan_message(self, title, text):
+        mbox = lv.msgbox(lv.layer_top())
+        mbox.add_title(title)
+        mbox.add_text(text)
+        ok = mbox.add_footer_button('OK')
+        ok.add_event_cb(lambda e: mbox.delete(), lv.EVENT.CLICKED, None)
+        close = mbox.add_close_button()
+        close.add_event_cb(lambda e: mbox.delete(), lv.EVENT.CLICKED, None)
+        mbox.add_event_cb(lambda e: mbox.delete(), lv.EVENT.CANCEL, None)
+
+    @staticmethod
+    def _copy_installed_app(app):
+        copied = App(load_icons=False)
+        for name in (
+            'name', 'publisher', 'short_description', 'long_description', 'fullname',
+            'version', 'categories', 'activities', 'services', 'installed_path',
+            'icon_path', 'icon_data', 'main_launcher_activity',
+        ):
+            if hasattr(app, name):
+                setattr(copied, name, getattr(app, name))
+        return copied
+
+    @staticmethod
+    def badgehub_app_to_mpos_app(bhapp):
+        name = bhapp.get('name')
+        short_description = bhapp.get('description')
+        fullname = bhapp.get('slug')
+        icon_url = None
+        try:
+            icon_url = bhapp.get('icon_map', {}).get('64x64', {}).get('url')
+        except Exception:
+            if __debug__: logger.debug('could not find icon_map 64x64 url')
+        blur_hash = bhapp.get('blur_hash')
+        category = bhapp.get('categories')
+        ratings = bhapp.get('ratings') or {}
+        rating_average = ratings.get('average')
+        rating_count = ratings.get('count', 0)
+        app = App(name, bhapp.get('publisher'), short_description, bhapp.get('long_description'), icon_url, bhapp.get('download_url'), fullname, bhapp.get('version'), category, bhapp.get('activities'), blur_hash=blur_hash, rating_average=rating_average, rating_count=rating_count)
+        return upystore_source.attach(app, bhapp)
+
+    @staticmethod
+    def _apply_default_styles(widget, border=0, radius=0, pad=0):
+        'Apply common default styles to reduce repetition'
+        widget.set_style_border_width(border, lv.PART.MAIN)
+        widget.set_style_radius(radius, lv.PART.MAIN)
+        widget.set_style_pad_all(pad, lv.PART.MAIN)
+
+    @staticmethod
+    def _add_click_handler(widget, callback, app):
+        'Register click handler to avoid repetition'
+        widget.add_event_cb(lambda e, a=app: callback(a), lv.EVENT.CLICKED, None)
