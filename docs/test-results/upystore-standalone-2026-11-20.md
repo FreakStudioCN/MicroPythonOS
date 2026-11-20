@@ -144,8 +144,9 @@ https://github.com/FreakStudioCN/MicroPythonOS/blob/feature/upystore-app/tests/f
 5. Rating submission has no agreed uPyStore contract; optional install/profile
    reporting is not enabled. D-Shell camera/QR, rollback UI, power-loss recovery,
    all-app compatibility and OTA are outside the accepted result.
-6. Fresh manual independent-app operation confirmation and a new physical video
-   remain separate from the automated result. The November 19 official-store
+6. The user confirmed all requested independent-app operations on November 20:
+   touch, scrolling, buttons, uninstall, install, Open, `2 + 3 = 5` and return.
+   A new physical video will be supplied later. The November 19 official-store
    video remains evidence for 1.5.1 only. Framebuffer PNGs are genuine device
    captures, not camera recordings.
 
