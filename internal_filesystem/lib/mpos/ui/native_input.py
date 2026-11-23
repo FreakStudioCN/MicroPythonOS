@@ -33,11 +33,6 @@ MIN_HOLD_MS = 60
 # A pointer that lands on the joystick and lifts within this window has not
 # dragged anywhere; a caller can use that as a tap.
 TAP_MS = 450
-# How far a finger may move between two polls and still be the same finger.
-# The GT911 and FT6x36 drivers report their slot number, so this only applies
-# to a driver that reports no point number at all; a poll is one frame
-# (28-33 ms) and a thumb covers a few tens of pixels in that time.
-MATCH_DISTANCE = 60
 
 
 class KeyHolds:
@@ -146,9 +141,8 @@ class TouchFingers:
     MOVING = "moving"
     RELEASED = "released"
 
-    def __init__(self, indev=None, match_distance=MATCH_DISTANCE):
+    def __init__(self, indev=None):
         self.indev = indev if indev is not None else find_touch_indev()
-        self.match_distance = match_distance
         self._down = {}
         self._next_finger = 0
 
@@ -167,24 +161,34 @@ class TouchFingers:
             return []
         if points is None:
             points = read_touches(self.indev)
+        points = list(points)
+        # Follow the thumbs, not the record numbers. A panel may report its
+        # points in touch order (the FT6x36 does), so a new finger can take
+        # the first record and push a held one down a slot; pairing each point
+        # with the nearest finger that was down keeps the joystick under the
+        # thumb that is holding it.
+        matched = self._assign(points)
 
         events = []
-        free = dict(self._down)
+        taken = set(matched.values())
+        free = {finger: point for finger, point in self._down.items()
+                if finger not in taken}
         down = {}
-        for point_id, x, y in points:
-            if point_id is not None:
-                finger = point_id
-                previous = self._down.get(finger)
-                free.pop(finger, None)
+        for index, (point_id, x, y) in enumerate(points):
+            if index in matched:
+                finger = matched[index]
+                previous = self._down[finger]
             else:
-                finger = self._nearest(free, x, y)
+                # A finger that was not down: keep the record's own number
+                # when nothing else is using it, so a stable driver gives the
+                # same number to the same finger on every poll.
                 previous = None
-                if finger is not None:
-                    previous = free.pop(finger)
-            if finger is None:
-                # A number that is neither down nor being released in this
-                # poll, so the press and its release never collide.
-                finger = self._allocate(down, free)
+                if (point_id is not None and point_id not in taken
+                        and point_id not in self._down):
+                    finger = point_id
+                else:
+                    finger = self._allocate(taken, free, down)
+                taken.add(finger)
             if previous is None:
                 events.append((finger, self.PRESSED, x, y))
             elif (x, y) != previous:
@@ -197,21 +201,38 @@ class TouchFingers:
         self._down = down
         return events
 
-    def _nearest(self, free, x, y):
-        """The finger already down closest to a point, if it is still the same one."""
-        limit = self.match_distance * self.match_distance
-        best = None
-        best_distance = limit
-        for finger, (old_x, old_y) in free.items():
-            distance = (x - old_x) * (x - old_x) + (y - old_y) * (y - old_y)
-            if distance <= best_distance:
-                best = finger
-                best_distance = distance
-        return best
+    def _assign(self, points):
+        """Pair every point with the finger that was down nearest to it.
 
-    def _allocate(self, down, free):
+        Greedy by distance: a thumb is the closest thing to where it was. The
+        record's number only breaks a tie, so a driver whose numbers are
+        stable is unaffected and one whose numbers move around (the FT6x36
+        swaps its two records arbitrarily) still follows the fingers.
+        """
+        if not self._down:
+            return {}
+        pairs = []
+        for finger, (old_x, old_y) in self._down.items():
+            for index, (point_id, x, y) in enumerate(points):
+                distance = (x - old_x) ** 2 + (y - old_y) ** 2
+                if point_id == finger:
+                    distance -= 1
+                pairs.append((distance, finger, index))
+        pairs.sort()
+        matched = {}
+        used_fingers = set()
+        used_points = set()
+        for _distance, finger, index in pairs:
+            if finger in used_fingers or index in used_points:
+                continue
+            matched[index] = finger
+            used_fingers.add(finger)
+            used_points.add(index)
+        return matched
+
+    def _allocate(self, taken, free, down):
         finger = self._next_finger
-        while finger in down or finger in free:
+        while finger in taken or finger in free or finger in down:
             finger += 1
         self._next_finger = finger + 1
         return finger

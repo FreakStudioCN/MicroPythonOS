@@ -346,6 +346,76 @@ class TestAppManagerStartApp(unittest.TestCase):
         result = AppManager.start_app("com.micropythonos.test_start_app")
         self.assertFalse(result)
 
+    def test_start_app_does_not_start_a_second_copy(self):
+        # A double tap on an icon must not run the activity twice: an app with
+        # a native engine would have its core stopped and remapped under the
+        # copy that is still ticking.
+        import mpos.ui.view as view
+
+        class FakeApp:
+            fullname = "com.example.duplicate"
+            installed_path = "apps/com.example.duplicate"
+            main_launcher_activity = {
+                "entrypoint": "main.py", "classname": "Main"}
+
+            def is_valid_launcher(self):
+                return False
+
+        class Main:
+            appFullName = "com.example.duplicate"
+
+        started = []
+        saved_get = AppManager.get
+        saved_execute = AppManager.execute_script
+        AppManager.get = staticmethod(lambda fullname: FakeApp())
+        AppManager.execute_script = staticmethod(
+            lambda *args, **kwargs: started.append(args) or True)
+        view.screen_stack.append((Main(), None, None, None))
+        try:
+            self.assertTrue(AppManager.start_app("com.example.duplicate"))
+            self.assertEqual(started, [], "the app was started twice")
+        finally:
+            view.screen_stack.pop()
+            AppManager.get = saved_get
+            AppManager.execute_script = saved_execute
+
+    def test_start_app_brings_a_background_app_back(self):
+        # start_app is also how an app that is further down the stack is
+        # brought forward; only the activity already in front is skipped.
+        import mpos.ui.view as view
+
+        class FakeApp:
+            fullname = "com.example.background"
+            installed_path = "apps/com.example.background"
+            main_launcher_activity = {
+                "entrypoint": "main.py", "classname": "Main"}
+
+            def is_valid_launcher(self):
+                return False
+
+        class Main:
+            appFullName = "com.example.background"
+
+        class Other:
+            appFullName = "com.example.other"
+
+        started = []
+        saved_get = AppManager.get
+        saved_execute = AppManager.execute_script
+        AppManager.get = staticmethod(lambda fullname: FakeApp())
+        AppManager.execute_script = staticmethod(
+            lambda *args, **kwargs: started.append(args) or True)
+        view.screen_stack.append((Main(), None, None, None))
+        view.screen_stack.append((Other(), None, None, None))
+        try:
+            self.assertTrue(AppManager.start_app("com.example.background"))
+            self.assertEqual(len(started), 1, "the app was not brought back")
+        finally:
+            view.screen_stack.pop()
+            view.screen_stack.pop()
+            AppManager.get = saved_get
+            AppManager.execute_script = saved_execute
+
 
 if __name__ == "__main__":
     unittest.main()

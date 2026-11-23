@@ -6,8 +6,10 @@ The same staging code feeds two targets:
   * the web build, which preloads ``apps`` and ``data`` into the browser
     filesystem and seeds them into the persistent /apps and /data stores on
     first boot (see web/shell.html);
-  * the ESP32-family full images, which pack the same tree into a littlefs2
-    image and merge it into the vfs partition of the flash image.
+  * the ESP32-family full images, which pack the same tree into a littlefs2e
+    image (with the third_party/mklittlefs submodule; every ``*.xip`` becomes
+    a contiguous extent the badge maps from flash) and merge it into the vfs
+    partition of the flash image.
 
 Usage:
     preload_fs.py stage --out DIR [--march xtensawin|rv32imc]
@@ -36,11 +38,13 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 APPS_LIST = REPO_ROOT / "scripts" / "preload_apps.txt"
+STAGE_TARGETS = ("device", "web")
 REPO_APPS_DIR = REPO_ROOT / "internal_filesystem" / "apps"
 DATA_DIR = REPO_ROOT / "internal_filesystem_data"
 COMPILE_SCRIPT = REPO_ROOT / "scripts" / "compile_dir.sh"
 DEFAULT_CACHE_DIR = REPO_ROOT / "tmp" / "preload_cache"
 DEFAULT_WORK_DIR = REPO_ROOT / "tmp" / "preload"
+MKLITTLEFS = REPO_ROOT / "third_party" / "mklittlefs" / "mklittlefs"
 
 BADGEHUB_API = "https://badgehub.eu/api/v3"
 USER_AGENT = "MicroPythonOS-preload/1.0"
@@ -51,6 +55,10 @@ BLOCK_SIZE = 4096
 READ_SIZE = 256
 PROG_SIZE = 256
 CACHE_SIZE = 1024
+
+# littlefs2e: a native core is packed as a contiguous extent so it can be
+# mapped from flash without a first-launch conversion.
+EXTENT_SUFFIX = ".xip"
 
 JUNK_DIRS = {"__pycache__"}
 JUNK_FILES = {".DS_Store"}
@@ -110,6 +118,11 @@ def parse_apps(apps_file):
                 raise PreloadError("%s:%d: expected key=value, got %r" % (apps_file, line_number, item))
             key, value = item.split("=", 1)
             options[key] = value
+        target = options.get("target")
+        if target is not None and target not in STAGE_TARGETS:
+            raise PreloadError(
+                "%s:%d: target must be one of %s, got %r"
+                % (apps_file, line_number, ", ".join(STAGE_TARGETS), target))
         entries.append({"source": source, "fullname": fullname, "options": options})
     if not entries:
         raise PreloadError("%s does not list any apps" % apps_file)
@@ -247,6 +260,10 @@ def _stage_apps(apps_file, repo_apps_dir, cache_dir, offline, options, destinati
 
     for entry in entries:
         fullname = entry["fullname"]
+        wanted = entry["options"].get("target")
+        if wanted is not None and wanted != options["target"]:
+            _log("  skipping %s (target %s)" % (fullname, wanted))
+            continue
         target = raw_dir / fullname
         if entry["source"] == "repo":
             source = repo_apps_dir / fullname
@@ -279,7 +296,7 @@ def _stage_apps(apps_file, repo_apps_dir, cache_dir, offline, options, destinati
 
 
 def stage(out_dir, apps_file=APPS_LIST, repo_apps_dir=REPO_APPS_DIR, data_dir=DATA_DIR,
-          cache_dir=DEFAULT_CACHE_DIR, offline=False, march=None):
+          cache_dir=DEFAULT_CACHE_DIR, offline=False, march=None, target="device"):
     out_dir = Path(out_dir)
     if out_dir.resolve() in (Path("/"), REPO_ROOT):
         raise PreloadError("refusing to stage into %s" % out_dir)
@@ -289,7 +306,7 @@ def stage(out_dir, apps_file=APPS_LIST, repo_apps_dir=REPO_APPS_DIR, data_dir=DA
     _log("Staging preloaded apps into %s ..." % out_dir)
     _stage_apps(
         Path(apps_file), Path(repo_apps_dir), Path(cache_dir), offline,
-        {"march": march}, out_dir / "apps",
+        {"march": march, "target": target}, out_dir / "apps",
     )
 
     if not Path(data_dir).is_dir():
@@ -331,63 +348,65 @@ def _app_partition(partitions_csv):
     raise PreloadError("%s has no ota_0/factory app partition" % partitions_csv)
 
 
-def _copy_into_littlefs(fs, source, prefix=""):
-    source = Path(source)
-    for entry in sorted(source.iterdir(), key=lambda item: item.name):
-        target = prefix + "/" + entry.name
-        if entry.is_dir():
-            try:
-                fs.makedirs(target)
-            except Exception as error:  # littlefs-python raises its own error type
-                if getattr(error, "code", None) != -17:  # LFS_ERR_EXIST
-                    raise
-            _copy_into_littlefs(fs, entry, target)
-        else:
-            with open(entry, "rb") as reader, fs.open(target, "wb") as writer:
-                shutil.copyfileobj(reader, writer)
+def _find_mklittlefs(explicit=None):
+    for candidate in (explicit, os.environ.get("MPOS_MKLITTLEFS"), MKLITTLEFS):
+        if candidate and Path(candidate).is_file():
+            return Path(candidate)
+    raise PreloadError(
+        "mklittlefs is not built; run scripts/build_mklittlefs.sh "
+        "or pass --mklittlefs")
 
 
-def pack(source_dir, partitions_csv, image_path):
-    import littlefs  # imported lazily so "stage" works without littlefs-python
+def pack(source_dir, partitions_csv, image_path, mklittlefs=None):
+    """Pack the staged tree into a littlefs2e image.
 
+    Files ending in ``.xip`` are written as extents: one contiguous, 64 KiB
+    aligned run that the device maps straight out of flash. A native core then
+    needs no defragmentation or conversion on first launch.
+    """
+    source_dir = Path(source_dir)
     vfs = _partition_row(partitions_csv, "vfs")
     if vfs["size"] % BLOCK_SIZE:
         raise PreloadError("vfs size 0x%X is not a multiple of %d" % (vfs["size"], BLOCK_SIZE))
+    tool = _find_mklittlefs(mklittlefs)
     image_path = Path(image_path)
     image_path.parent.mkdir(parents=True, exist_ok=True)
     image_path.unlink(missing_ok=True)
-    image_path.touch()
 
-    block_count = vfs["size"] // BLOCK_SIZE
-    context = littlefs.UserContextFile(str(image_path))
-    fs = littlefs.LittleFS(
-        context=context,
-        block_size=BLOCK_SIZE,
-        block_count=block_count,
-        read_size=READ_SIZE,
-        prog_size=PROG_SIZE,
-        cache_size=CACHE_SIZE,
-    )
-    try:
-        _copy_into_littlefs(fs, source_dir)
-    except littlefs.errors.LittleFSError as error:
-        if getattr(error, "code", None) == -28:  # LFS_ERR_NOSPC
+    extents = sorted(path.relative_to(source_dir) for path in source_dir.rglob("*" + EXTENT_SUFFIX))
+    command = [
+        str(tool),
+        "-b", str(BLOCK_SIZE),
+        "-p", str(PROG_SIZE),
+        "-r", str(READ_SIZE),
+        "-m", str(CACHE_SIZE),
+        "-N",
+        "-s", str(vfs["size"]),
+        "-c", str(source_dir),
+    ]
+    for extent in extents:
+        command.extend(["-x", str(extent)])
+    command.append(str(image_path))
+
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        if "full" in detail.lower():
             raise PreloadError(
                 "preloaded tree (%s) does not fit in the %s vfs partition"
                 % (_format_size(_tree_size(source_dir)), _format_size(vfs["size"]))
             )
-        raise
-    finally:
-        fs.unmount()
+        raise PreloadError("mklittlefs failed: %s" % (detail or "exit %d" % result.returncode))
 
     written = image_path.stat().st_size
-    if written > vfs["size"]:
-        raise PreloadError("littlefs wrote %d bytes, larger than the vfs partition" % written)
-    if written < vfs["size"]:
-        with open(image_path, "ab") as padding:
-            padding.write(b"\xff" * (vfs["size"] - written))
-    _log("Packed %s into %s (vfs at 0x%X, %s)"
-         % (_format_size(_tree_size(source_dir)), image_path.name, vfs["offset"], _format_size(vfs["size"])))
+    if written != vfs["size"]:
+        raise PreloadError(
+            "mklittlefs wrote %d bytes, expected the %s vfs partition"
+            % (written, _format_size(vfs["size"])))
+    _log("Packed %s into %s (vfs at 0x%X, %s%s)"
+         % (_format_size(_tree_size(source_dir)), image_path.name, vfs["offset"],
+            _format_size(vfs["size"]),
+            ", %d extent(s)" % len(extents) if extents else ""))
     return vfs
 
 
@@ -480,8 +499,9 @@ def all_command(args):
         cache_dir=args.cache_dir,
         offline=args.offline,
         march=args.march,
+        target=args.target,
     )
-    pack(stage_dir, args.partitions, image_path)
+    pack(stage_dir, args.partitions, image_path, mklittlefs=args.mklittlefs)
     return merge(args.build_dir, args.partitions, image_path)
 
 
@@ -494,6 +514,8 @@ def build_parser():
     common.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR))
     common.add_argument("--offline", action="store_true",
                         help="use the BadgeHub cache; never download")
+    common.add_argument("--target", choices=STAGE_TARGETS, default="device",
+                        help="stage only apps for this target (default: device)")
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -506,6 +528,8 @@ def build_parser():
     pack_parser.add_argument("--source", required=True)
     pack_parser.add_argument("--partitions", required=True)
     pack_parser.add_argument("--image", required=True)
+    pack_parser.add_argument("--mklittlefs", default=None,
+                             help="mklittlefs binary (default: third_party/mklittlefs)")
 
     merge_parser = subparsers.add_parser("merge", help="merge a filesystem image into the firmware")
     merge_parser.add_argument("--build-dir", required=True)
@@ -517,6 +541,8 @@ def build_parser():
     all_parser.add_argument("--partitions", required=True)
     all_parser.add_argument("--march", default=None)
     all_parser.add_argument("--work-dir", default=str(DEFAULT_WORK_DIR))
+    all_parser.add_argument("--mklittlefs", default=None,
+                            help="mklittlefs binary (default: third_party/mklittlefs)")
 
     return parser
 
@@ -527,9 +553,10 @@ def main(argv=None):
     try:
         if args.command == "stage":
             stage(args.out, apps_file=args.apps_file, repo_apps_dir=args.repo_apps_dir,
-                  data_dir=args.data_dir, cache_dir=args.cache_dir, offline=args.offline, march=args.march)
+                  data_dir=args.data_dir, cache_dir=args.cache_dir, offline=args.offline,
+                  march=args.march, target=args.target)
         elif args.command == "pack":
-            pack(args.source, args.partitions, args.image)
+            pack(args.source, args.partitions, args.image, mklittlefs=args.mklittlefs)
         elif args.command == "merge":
             merge(args.build_dir, args.partitions, args.image)
         else:

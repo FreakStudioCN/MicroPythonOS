@@ -5,6 +5,56 @@ Builtin Apps:
 - AppStore: connect the existing built-in UI and update service to uPyStore by default in this project build, retaining selectable BadgeHub; verify and stage installs, validate source/compiled launchers, clear helper caches and obsolete files on upgrade, migrate receipts to app preferences, and clean up page timers and widgets.
 
 Frameworks:
+- littlefs2e: contiguous "extent" files on the internal filesystem. An extent is
+  an immutable, aligned run of blocks whose bytes are stored verbatim, so it can
+  be mapped from flash (XIP) instead of being read through the CTZ skip-list.
+  `mpos.extent` creates/reads/verifies them. Extents use the standard disk 2.1,
+  so stock littlefs can mount the image; it treats extent blocks as free space,
+  so stock tools must be read-only. A normal
+  `open(path, "wb")` converts an extent back to an ordinary file, and extent
+  creation defragments a fragmented filesystem by relocating the files in the
+  target window. Native cores can be stored and executed this way.
+- littlefs2e: the defragmenter also relocates directory metadata pairs, so a
+  filesystem whose free space is only broken up by directories can still yield
+  a contiguous XIP run. It is now one C pass (`lfs2e.defrag`), which replaces
+  the Python scan, and a local `.mpk` install closes the archive around the
+  defrag so no open handle straddles a moved file. A split directory's tail
+  pair still cannot be moved, so a window holding one is skipped.
+- The App Store install shows "Defragmenting storage... 60%" while an extent
+  is being made room for, instead of freezing on the last download percentage:
+  the defragmenter runs in steps that yield to the UI. A large window's round
+  budget now scales with its size, so a fragmented filesystem can still take a
+  Doom-sized engine.
+- littlefs2 caches a whole block instead of a quarter of one, so a metadata
+  scan crosses the block device once per block and the defragmenter is about
+  twice as fast (a 48-block window on a 7 MiB filesystem: 18 s to 11 s). It
+  costs 6 KiB of RAM at mount and about 3 KiB per open file; the on-disk
+  format and the inline threshold are unchanged.
+- Writing a file after creating an extent could land on the extent's blocks:
+  the allocator's lookahead still read the freshly committed run as free, so
+  an extracted `.xip` could be overwritten by the next file in the same
+  session and fail its CRC later. Committing (or aborting) an extent now drops
+  the lookahead, so the next allocation rescans the tree.
+- App packages can carry a `"native"` map in `MANIFEST.JSON` (platform key to
+  file names) and the App Store installs only the files for the running host:
+  `<soc>.xip` for a flash-resident core, `module_<arch>.mpy` for a native
+  module. One package then serves badges and desktops. A selected `.xip` is
+  streamed straight into a littlefs2e extent at install time, so a large engine
+  has no first-launch conversion step; its entry CRC is stored with the extent
+  and checked before the core is mapped. `mpos.platform` is the single place
+  that derives the two keys from `sys.implementation`.
+- `mpos.zipasset` reads one entry out of a `.zip` into a buffer, with progress
+  and a CRC check, so an app can ship its read-only data deflated and unpack it
+  into PSRAM at launch instead of keeping it expanded on flash.
+- `mpos.extent.Writer` streams data into a reserved extent (reserve, write
+  chunks, commit) for callers that produce the bytes as they arrive; the
+  installer uses it for `.xip` entries.
+- `mpos_core.start()` takes an optional expected CRC32 and refuses a corrupt
+  engine before mapping it executable. A stock littlefs write can overwrite an
+  extent's blocks (it sees them as free), and this turns that into a clear
+  "engine is corrupt, reinstall" instead of a crash.
+- `NativeActivity.set_message()` replaces the standing message text in place, so
+  a launch can report progress without creating a label per update.
 - Multi-touch: the GT911 and FocalTech drivers read every touch point (`get_touches()`) instead of only the first, and `mpos.ui.multitouch.MultiTouchGesture` reports pinch scale, rotation and pan from two fingers. A second finger is gesture-only: the driver sends the contact to LVGL as released until every finger lifts, so a pinch cannot click the widget under it or trigger the back-swipe.
 - AudioManager: `get()` rebuilds a singleton whose initialisation never finished. A
   constructor call that raised (a wrong keyword argument, a preferences read failing
@@ -19,6 +69,11 @@ Frameworks:
   while the hardware back key keeps working. `NativeActivity` gained
   `game_to_panel()`/`game_rect_to_panel()`, the inverse of `to_game()`, so an app can
   draw a hint or HUD over the rotated picture in its own coordinates.
+- littlefs2e lives in its own fork (MicroPythonOS/littlefs_with_extents_and_defrag),
+  consumed as the `third_party/littlefs2e` submodule and prefixed into the
+  MicroPython tree by `scripts/sync_littlefs2e.sh` at build time. The fork carries
+  the library, its test-runner cases and `EXTENTS.md`, so `tests/littlefs_run.sh`
+  runs the pinned source directly and `--full` runs the whole upstream suite.
 
 Builtin Apps:
 - OSUpdate: an update check tries the remaining mirror when the first one is unreachable. A single failed request used to abort the whole check, so a device that picked a down mirror never saw the available update.
@@ -91,7 +146,7 @@ Testing:
 Build:
 - Full flash images ship a filesystem: `scripts/preload_fs.py` stages the sample media and a shared set of apps, precompiles them and packs them into a littlefs image merged into the vfs partition. The same staging feeds the web bundle. `--no-preload-fs` (`MPOS_PRELOAD_FS=0`) builds a firmware-only image; the 4 MB targets skip it.
 - Partition tables: full images use the compact badge preamble and a 7 MB filesystem at `0x900000` on the 16 MB layout; `.ota` images stay partition-offset independent, so in-place updates keep working.
-- littlefs-python 0.19.0 is only needed to pack the device filesystem (CI installs it in a venv, pointed at with `MPOS_PRELOAD_PYTHON`).
+- The preloaded filesystem is packed by the `third_party/mklittlefs` submodule instead of littlefs-python, so the build needs no Python package for it. Native cores (`*.xip`) are written as littlefs2e extents: one contiguous, 64 KiB aligned run, so a preinstalled engine starts without a first-launch defragmentation and conversion.
 - ESP32-P4: images stay compatible with rev <3.0 chips — the esp32p4 build sets `CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y` (a no-op on ESP-IDF 5.5.1; from 5.5.3 its default would build a v3-only image and a v1.x board would refuse the OTA update), and lvgl_micropython lets ESP-IDF pick the MIPI-DSI PHY PLL reference clock, which a rev 3.x LL build no longer accepts and would abort on (#376).
 - App releases: `bundle_apps.sh --app <fullname>` packages only the named apps and merges just their entries into the existing index, preserving index-only fixes and every other entry; `make check-app-versions` and a CI job for PRs touching `internal_filesystem/apps/` report apps with commits after their last `MANIFEST.JSON` version bump (and uncommitted edits), so a source change can no longer miss users silently (#388).
 

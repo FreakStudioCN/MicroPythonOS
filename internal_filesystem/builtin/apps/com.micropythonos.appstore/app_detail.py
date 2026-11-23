@@ -3,6 +3,10 @@ import logging
 import lvgl as lv
 
 from mpos import Activity, AppManager, TaskManager, WidgetAnimator
+try:
+    from mpos import extent as extent_files
+except ImportError:
+    extent_files = None
 from mpos.ui import STAR_SYMBOL, add_focus_highlight
 import store_source
 from store_install import install_package, update_available, forget_receipt, exists, clear_app_cache
@@ -506,6 +510,15 @@ class AppDetail(Activity):
         scaled_percent += scaled_percent_start
         self.progress_bar.set_value(scaled_percent, True)
 
+    async def space_progress(self, phase, percent):
+        """Called while an extent reservation defragments the filesystem."""
+        if phase == extent_files.PHASE_SPACE or percent <= 0:
+            self.install_label.set_text("Defragmenting storage...")
+        else:
+            self.install_label.set_text("Defragmenting storage... %d%%" % percent)
+        # The download bar keeps its position; this is a separate phase.
+        await TaskManager.sleep(1)
+
     async def download_and_install(self, app_obj, dest_folder):
         app_fullname = app_obj.fullname
         self._show_progress_bar()
@@ -515,6 +528,7 @@ class AppDetail(Activity):
             if receipt and receipt.get("version"):
                 app_obj._remote_version = receipt["version"]
                 app_obj.revision = receipt.get("revision")
+
         except Exception as e:
             logger.warning("APPSTORE_INSTALL_FAILED %s %s %s", app_fullname, type(e).__name__, str(e))
             logger.error("download failed: %s", store_source.error_text(e))

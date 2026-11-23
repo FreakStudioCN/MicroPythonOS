@@ -259,6 +259,15 @@ apply_patch "$codebasedir"/lvgl_micropython/lib/micropython "$codebasedir"/lvgl_
 echo "Applying lvgl_micropython mpremote disable auto-soft-reset patch..."
 apply_patch "$codebasedir"/lvgl_micropython/lib/micropython "$codebasedir"/lvgl_micropython/mpremote_no_auto_soft_reset.patch
 
+echo "Applying littlefs2e MicroPython glue patch..."
+apply_patch "$codebasedir"/lvgl_micropython/lib/micropython "$codebasedir"/patches/lfs2e_micropython.patch
+
+echo "Copying littlefs2e sources from third_party/littlefs2e..."
+"$mydir"/sync_littlefs2e.sh
+
+echo "Applying littlefs2 block-sized cache patch..."
+apply_patch "$codebasedir"/lvgl_micropython/lib/micropython "$codebasedir"/patches/lfs2_cache_size.patch
+
 echo "Applying lvgl_micropython/lib/lvgl bmp scaling fix patch..."
 apply_patch "$codebasedir"/lvgl_micropython/lib/lvgl "$codebasedir"/lvgl_micropython/lib_lvgl_lv_bmp.c.patch
 
@@ -633,18 +642,17 @@ if [ "$target" == "esp32" -o "$target" == "esp32s3" -o "$target" == "unphone" -o
 
 	if [ -n "$partition_csv" ]; then
 		preload_python="${MPOS_PRELOAD_PYTHON:-python3}"
-		if ! "$preload_python" -c "import littlefs" >/dev/null 2>&1; then
-			echo "ERROR: littlefs-python is required to build the preloaded filesystem." >&2
-			echo "       Install it (python3 -m pip install littlefs-python==0.19.0)," >&2
-			echo "       point MPOS_PRELOAD_PYTHON at a venv that has it, or use --no-preload-fs." >&2
-			exit 1
-		fi
+		# The packer is not a Python module: it is the third_party/mklittlefs
+		# submodule, which packs native cores as littlefs2e extents (so a
+		# sideloaded engine needs no first-launch conversion).
+		"$mydir"/build_mklittlefs.sh
 		echo ""
 		echo "=== Preloaded filesystem ($target) ==="
 		"$preload_python" "$mydir"/preload_fs.py all \
 			--build-dir "$codebasedir/lvgl_micropython/lib/micropython/ports/esp32/$builddir" \
 			--partitions "$partition_csv" \
 			--march "$builtin_march" \
+			--target device \
 			--work-dir "$codebasedir/tmp/preload/$target" \
 			--cache-dir "$codebasedir/tmp/preload_cache"
 		preload_status=$?
@@ -929,6 +937,7 @@ elif [ "$target" == "web" ]; then
 	staged_bundled="$codebasedir"/web/.preload_stage
 	rm -rf "$staged_bundled"
 	python3 "$mydir"/preload_fs.py stage --out "$staged_bundled" \
+		--target web \
 		--cache-dir "$codebasedir/tmp/preload_cache"
 	staged_bundled_apps="$staged_bundled"/apps
 	staged_bundled_data="$staged_bundled"/data

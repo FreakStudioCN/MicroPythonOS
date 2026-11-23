@@ -105,6 +105,41 @@ class TestTouchFingers(unittest.TestCase):
         events = self.touches.poll()
         self.assertEqual(events, [(4, TouchFingers.RELEASED, 30, 100)])
 
+    def test_a_held_finger_keeps_its_thumb_when_the_records_are_reordered(self):
+        # The FT6x36 numbers its records by touch order, so the thumb that is
+        # already down moves to slot 1 when the other one lands. The finger
+        # that walks must stay the walking finger: only the new one presses.
+        self.panel.touches = [(0, 30, 120)]
+        self.assertEqual(
+            self.touches.poll(), [(0, TouchFingers.PRESSED, 30, 120)])
+
+        self.panel.touches = [(0, 220, 175), (1, 30, 120)]
+        self.assertEqual(
+            self.touches.poll(), [(1, TouchFingers.PRESSED, 220, 175)])
+
+        # Lifting the new finger releases slot 1, not the walking thumb.
+        self.panel.touches = [(0, 30, 120)]
+        self.assertEqual(
+            self.touches.poll(), [(1, TouchFingers.RELEASED, 220, 175)])
+
+    def test_one_fast_finger_is_not_mistaken_for_a_reordered_panel(self):
+        self.panel.touches = [(0, 30, 120)]
+        self.touches.poll()
+        self.panel.touches = [(0, 200, 120)]
+        self.assertEqual(
+            self.touches.poll(), [(0, TouchFingers.MOVING, 200, 120)])
+
+    def test_a_reordered_finger_keeps_its_number_while_it_moves(self):
+        self.panel.touches = [(0, 30, 120)]
+        self.touches.poll()
+        # The second finger lands and takes the first record.
+        self.panel.touches = [(0, 220, 175), (1, 30, 120)]
+        self.touches.poll()
+        # The held thumb walks, and the panel still puts the new finger first.
+        self.panel.touches = [(0, 220, 175), (1, 110, 120)]
+        self.assertEqual(
+            self.touches.poll(), [(0, TouchFingers.MOVING, 110, 120)])
+
     def test_the_display_rotation_is_applied(self):
         # A 90 degree display turns the panel's (x, y) into (299 - y, x).
         self.panel.rotation = 1
@@ -348,6 +383,28 @@ class ThumbZonesTest(unittest.TestCase):
         self.zones.pressed(80, 100, 1)
         self.zones.moving(40, 100, 1)
         self.zones.released(40, 100, 1)
+        self.assertTrue(self.hold.is_held(KEYS["fire"]))
+
+    def test_a_reordered_panel_still_walks_and_fires(self):
+        # The whole path the watch takes: a panel that reports the newest
+        # finger first must still leave the left thumb on the stick.
+        panel = FakePanel([(0, 80, 100)])
+        fingers = TouchFingers(panel)
+
+        def apply(events):
+            for finger, phase, x, y in events:
+                if phase == TouchFingers.PRESSED:
+                    self.zones.pressed(x, y, finger)
+                elif phase == TouchFingers.MOVING:
+                    self.zones.moving(x, y, finger)
+                else:
+                    self.zones.released(x, y, finger)
+
+        apply(fingers.poll())
+        panel.touches = [(0, 240, 180), (1, 60, 100)]
+        apply(fingers.poll())
+        apply(fingers.poll())
+        self.assertTrue(self.hold.is_held(KEYS["left"]))
         self.assertTrue(self.hold.is_held(KEYS["fire"]))
 
     def test_reset_lets_go_of_every_zone(self):

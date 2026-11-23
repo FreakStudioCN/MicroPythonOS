@@ -80,12 +80,6 @@ jobs:
           restore-keys: |
             preload-apps-v1-
 
-      - name: Set up littlefs-python for the preloaded filesystem
-        run: |
-          python3 -m venv .venv-preload
-          .venv-preload/bin/pip install --disable-pip-version-check littlefs-python==0.19.0
-          echo "MPOS_PRELOAD_PYTHON=$PWD/.venv-preload/bin/python" >> "$GITHUB_ENV"
-
       - name: Build LVGL MicroPython esp32
         run: |
           ./scripts/build_mpos.sh esp32
@@ -176,12 +170,6 @@ jobs:
           key: preload-apps-v1-${{ hashFiles('scripts/preload_apps.txt') }}
           restore-keys: |
             preload-apps-v1-
-
-      - name: Set up littlefs-python for the preloaded filesystem
-        run: |
-          python3 -m venv .venv-preload
-          .venv-preload/bin/pip install --disable-pip-version-check littlefs-python==0.19.0
-          echo "MPOS_PRELOAD_PYTHON=$PWD/.venv-preload/bin/python" >> "$GITHUB_ENV"
 
       - name: Build LVGL MicroPython esp32s3
         run: |
@@ -274,6 +262,14 @@ jobs:
       - name: Run syntax tests on unix
         run: |
           ./tests/syntax.sh
+
+      - name: Run littlefs2e extent and defragmentation tests
+        run: |
+          # The fork's test runner parses the .toml cases with the `toml`
+          # module, which the runner images do not ship.
+          python3 -m venv .venv-littlefs
+          .venv-littlefs/bin/pip install --disable-pip-version-check toml
+          PATH="$PWD/.venv-littlefs/bin:$PATH" ./tests/littlefs_run.sh --full
 
       - name: Run unit tests on unix
         run: |

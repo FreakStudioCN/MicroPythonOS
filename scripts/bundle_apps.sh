@@ -70,7 +70,6 @@ fi
 # These apps are for testing, or aren't ready yet:
 blacklist="com.quasikili.quasidoodle" # com.quasikili.quasidoodle doesn't work on touch screen devices
 blacklist="$blacklist com.micropythonos.errortest com.micropythonos.errortest_delayed com.micropythonos.errortest_resume" # intentional bad apps for testing
-blacklist="$blacklist com.micropythonos.doom" # not ready yet
 blacklist="$blacklist cz.ucw.pavel.calendar cz.ucw.pavel.cellular cz.ucw.pavel.compass cz.ucw.pavel.weather" # not ready yet
 
 echo "[" | tee -a "$outjson"
@@ -135,10 +134,22 @@ for apprepo in internal_filesystem/apps; do
             find -L "$appfullpath" -exec touch -t 202501010000.00 {} \;
             rm -f "$mpkname"
             echo "Creating $mpkname with deterministic file order..."
-            # -x is what actually keeps __pycache__ out: zip -r re-walks the
-            # directory entries handed to it, so filtering the file list alone
-            # still lets zip pack the whole tree it recurses into.
-            (cd "$apprepo" && (find -L "$appdir" -type d; find -L "$appdir" -type f) | grep -v ".git/" | sort | TZ=CET zip -X -r0 "$mpkname" -@ -x "*/__pycache__/*" -x "*/__pycache__")
+            # The stream order is the contract, not the central directory: the
+            # installer reads entries as they arrive and needs MANIFEST.JSON
+            # before any native file (its "native" map decides which engine
+            # files to keep). zip -r walks a directory in readdir order, so the
+            # archive is built in three appends: the top-level entry, the
+            # manifest, then the rest. -x is what actually keeps __pycache__
+            # out: zip -r re-walks the directory entry it was handed, so
+            # filtering the file list alone still packs the whole tree.
+            manifest_rel=${manifest#"$apprepo"/}
+            (
+                cd "$apprepo" &&
+                TZ=CET zip -X -0 "$mpkname" "$appdir/" &&
+                TZ=CET zip -X -0 -g "$mpkname" "$manifest_rel" &&
+                TZ=CET zip -X -r0 -g "$mpkname" "$appdir" \
+                    -x "$manifest_rel" -x "*/__pycache__/*" -x "*/__pycache__"
+            )
             if [ -f "$appfullpath/icon_64x64.png" ]; then
                 icon_src="$appfullpath/icon_64x64.png"
             else
