@@ -14,6 +14,7 @@ class TestUpdates(unittest.TestCase):
     def setUp(self):
         asyncio.new_event_loop()
         self.saved = []
+        self.replace(store_source, 'current_source', lambda: 'upystore')
         self.replace(appstore_core.AppUpdateManager, '_instance', None)
         self.manager = appstore_core.AppUpdateManager.get_instance()
         self.replace(self.manager, '_notify_updates_available', lambda: None)

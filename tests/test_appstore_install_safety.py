@@ -27,6 +27,43 @@ class TestInstallSafety(unittest.TestCase):
     def setUp(self):
         asyncio.new_event_loop()
 
+    def test_paused_space_progress_ignores_destroyed_label(self):
+        detail = app_detail.AppDetail()
+        detail._has_foreground = False
+        detail.install_label = None
+        asyncio.get_event_loop().run_until_complete(detail.space_progress(0, 0))
+
+    def test_verified_archive_uses_real_async_framework_extractor(self):
+        import ubinascii
+        import json
+        import store_install
+        from mpos.content.streaming_unzip import StreamingUnzip
+
+        if not hasattr(StreamingUnzip, "feed_async"):
+            self.skipTest("Runtime has no asynchronous archive extractor")
+        root = "data/appstore-async-extraction-test"
+        destination = root + "/com.test.probe"
+        archive = root + "/probe.mpk"
+        store_install.mkdirs(root)
+        original = AppManager.install_mpk
+
+        def forbid_legacy(*args):
+            raise RuntimeError("Expected the current asynchronous extractor")
+
+        try:
+            with open(archive, "wb") as output:
+                output.write(ubinascii.a2b_base64("UEsDBBQAAAAAAAAAIVwAAAAAAAAAAAAAAAAPAAAAY29tLnRlc3QucHJvYmUvUEsDBBQAAAAAAAAAIVzM5EWE4gAAAOIAAAAcAAAAY29tLnRlc3QucHJvYmUvTUFOSUZFU1QuSlNPTnsiZnVsbG5hbWUiOiAiY29tLnRlc3QucHJvYmUiLCAibmFtZSI6ICJQcm9iZSIsICJwdWJsaXNoZXIiOiAiTWljcm9QeXRob25PUyIsICJ2ZXJzaW9uIjogIjEuMC4wIiwgImFjdGl2aXRpZXMiOiBbeyJlbnRyeXBvaW50IjogIm1haW4ucHkiLCAiY2xhc3NuYW1lIjogIlByb2JlIiwgImludGVudF9maWx0ZXJzIjogW3siYWN0aW9uIjogIm1haW4iLCAiY2F0ZWdvcnkiOiAibGF1bmNoZXIifV19XX1QSwMEFAAAAAAAAAAhXBfnE7oSAAAAEgAAABYAAABjb20udGVzdC5wcm9iZS9tYWluLnB5Y2xhc3MgUHJvYmU6IHBhc3MKUEsBAhQAFAAAAAAAAAAhXAAAAAAAAAAAAAAAAA8AAAAAAAAAAAAAAIABAAAAAGNvbS50ZXN0LnByb2JlL1BLAQIUABQAAAAAAAAAIVzM5EWE4gAAAOIAAAAcAAAAAAAAAAAAAACAAS0AAABjb20udGVzdC5wcm9iZS9NQU5JRkVTVC5KU09OUEsBAhQAFAAAAAAAAAAhXBfnE7oSAAAAEgAAABYAAAAAAAAAAAAAAIABSQEAAGNvbS50ZXN0LnByb2JlL21haW4ucHlQSwUGAAAAAAMAAwDLAAAAjwEAAAAA"))
+            AppManager.install_mpk = forbid_legacy
+            asyncio.get_event_loop().run_until_complete(store_install.extract_package(archive, destination, "com.test.probe"))
+            with open(destination + "/MANIFEST.JSON") as source:
+                self.assertEqual(json.load(source)["fullname"], "com.test.probe")
+            with open(destination + "/main.py") as source:
+                self.assertEqual(source.read(), "class Probe: pass\n")
+            store_install.validate_manifest(destination, "com.test.probe", "1.0.0")
+        finally:
+            AppManager.install_mpk = original
+            store_install.remove_tree(root)
+
     def test_valid_launcher_compiles_on_micropython(self):
         import json
         import store_install
@@ -74,7 +111,10 @@ class TestInstallSafety(unittest.TestCase):
         async def progress(*args, **kwargs):
             pass
 
+        calls = []
+
         async def install(*args, **kwargs):
+            calls.append(kwargs)
             return {"version": "1.1.0", "revision": 2}
 
         detail._update_progress = progress
@@ -88,6 +128,7 @@ class TestInstallSafety(unittest.TestCase):
             self.assertIn("Original description", detail.long_desc_label.text)
             self.assertEqual(detail.app._remote_version, "1.1.0")
             self.assertEqual(detail.app.revision, 2)
+            self.assertEqual(calls[0]["space_callback"], detail.space_progress)
         finally:
             app_detail.install_package = original
             AppManager.refresh_apps = original_refresh

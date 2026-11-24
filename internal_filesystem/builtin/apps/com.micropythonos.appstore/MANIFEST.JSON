@@ -4,7 +4,7 @@
   "short_description": "Store for App(lication)s",
   "long_description": "Find and install apps for your device.",
   "fullname": "com.micropythonos.appstore",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "categories": [
     "Appstore"
   ],

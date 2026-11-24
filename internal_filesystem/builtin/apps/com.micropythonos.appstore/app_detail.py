@@ -512,7 +512,9 @@ class AppDetail(Activity):
 
     async def space_progress(self, phase, percent):
         """Called while an extent reservation defragments the filesystem."""
-        if phase == extent_files.PHASE_SPACE or percent <= 0:
+        if not self.has_foreground():
+            return
+        if percent <= 0 or (extent_files is not None and phase == extent_files.PHASE_SPACE):
             self.install_label.set_text("Defragmenting storage...")
         else:
             self.install_label.set_text("Defragmenting storage... %d%%" % percent)
@@ -524,7 +526,7 @@ class AppDetail(Activity):
         self._show_progress_bar()
         await self._update_progress(5)
         try:
-            receipt = await install_package(app_obj, progress_callback=self.pcb)
+            receipt = await install_package(app_obj, progress_callback=self.pcb, space_callback=self.space_progress)
             if receipt and receipt.get("version"):
                 app_obj._remote_version = receipt["version"]
                 app_obj.revision = receipt.get("revision")

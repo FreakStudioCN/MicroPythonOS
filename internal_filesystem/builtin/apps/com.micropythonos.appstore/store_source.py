@@ -6,7 +6,7 @@ from mpos import BuildInfo, DownloadManager, SharedPreferences, TaskManager
 
 logger = logging.getLogger(__name__)
 BASE_URL = "https://upystore.io"
-DEFAULT_SOURCE = "upystore"
+DEFAULT_SOURCE = "badgehub"
 _REQUESTS = []
 
 BADGEHUB_INDEX = "https://badgehub.eu/api/v3/project-summaries?badge=mpos_api_%s" % BuildInfo.version.api_level

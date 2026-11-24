@@ -7,7 +7,7 @@ import shutil
 import struct
 import sys
 
-from mpos import AppManager, BuildInfo, ConnectivityManager
+from mpos import AppManager, BuildInfo, ConnectivityManager, TaskManager
 from store_source import absolute_url, current_source, fetch_details, identity, request
 
 logger = logging.getLogger(__name__)
@@ -226,18 +226,57 @@ def update_available(fullname, version, revision=None, source=None):
     )
 
 
-async def install_package(app, progress_callback=None):
+async def extract_package(archive, destination, fullname, space_callback=None):
+    try:
+        from mpos import extent as extent_files
+        from mpos.content.streaming_unzip import StreamingUnzip
+    except ImportError:
+        AppManager.install_mpk(archive, destination)
+        return
+    if not hasattr(StreamingUnzip, "feed_async"):
+        AppManager.install_mpk(archive, destination)
+        return
+    extractor = StreamingUnzip(
+        destination,
+        expected_app_name=fullname,
+        free_space_limit=lambda required: AppManager._check_free_space(".", required),
+    )
+    source = open(archive, "rb")
+
+    async def reserve_space(length, align):
+        nonlocal source
+        position = source.tell()
+        source.close()
+        try:
+            return await extent_files.open_writer(length, align, defrag_first=True, progress=space_callback)
+        finally:
+            source = open(archive, "rb")
+            source.seek(position)
+
+    try:
+        while True:
+            chunk = source.read(4096)
+            if not chunk:
+                break
+            await extractor.feed_async(chunk, reserve_space)
+            await TaskManager.sleep_ms(0)
+        extractor.finish()
+    finally:
+        source.close()
+
+
+async def install_package(app, progress_callback=None, space_callback=None):
     global _INSTALLING
     if _INSTALLING:
         raise RuntimeError("Another package install is running")
     _INSTALLING = True
     try:
-        return await _install_package(app, progress_callback)
+        return await _install_package(app, progress_callback, space_callback)
     finally:
         _INSTALLING = False
 
 
-async def _install_package(app, progress_callback):
+async def _install_package(app, progress_callback, space_callback):
     fullname = identity(app.get("fullname") if isinstance(app, dict) else app.fullname)
     source = (
         app.get("_store_source", current_source())
@@ -308,7 +347,7 @@ async def _install_package(app, progress_callback):
         gc.collect()
         stats = os.statvfs(".")
         check_archive(archive, fullname, stats[0] * stats[4])
-        AppManager.install_mpk(archive, stage)
+        await extract_package(archive, stage, fullname, space_callback)
         validate_manifest(stage, fullname, version)
         had_old = promote(stage, destination, backup)
         promoted = True

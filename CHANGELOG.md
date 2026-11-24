@@ -2,7 +2,7 @@ Future release (next version)
 =====
 
 Builtin Apps:
-- AppStore: connect the existing built-in UI and update service to uPyStore by default in this project build, retaining selectable BadgeHub; verify and stage installs, validate source/compiled launchers, clear helper caches and obsolete files on upgrade, migrate receipts to app preferences, and clean up page timers and widgets.
+- AppStore: add a selectable uPyStore backend while keeping BadgeHub as the default; verify and stage MPK installs, clear obsolete helpers, validate launcher declarations, and retain asynchronous storage-reservation progress on supported firmware.
 
 Frameworks:
 - littlefs2e: contiguous "extent" files on the internal filesystem. An extent is

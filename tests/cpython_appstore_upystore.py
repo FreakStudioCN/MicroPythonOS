@@ -173,8 +173,8 @@ class HostTests(EnvironmentMixin, unittest.TestCase):
         with self.assertRaises(ValueError):
             self.install.check_archive("x.mpk", "com.example.upgrade", 1000000)
 
-    def test_default_source_is_upystore(self):
-        self.assertEqual(self.source.current_source(), "upystore")
+    def test_default_source_preserves_badgehub(self):
+        self.assertEqual(self.source.current_source(), "badgehub")
 
     def test_identity_slug_and_relative_icon_mapping(self):
         value = self.source.normalize(
