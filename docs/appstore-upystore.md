@@ -1,14 +1,15 @@
 # Official AppStore integration with uPyStore
 
-For the organization/upstream synchronization, current test scope and evidence,
-see [the synchronization regression record](test-results/appstore-upstream-sync-2026-11-20.md).
+For the current standards review, changes and test scope, see
+[the standards review record](test-results/appstore-standards-2026-11-23.md).
+Earlier synchronization results remain dated historical evidence.
 
 This branch adapts `com.micropythonos.appstore`, retaining its Activity, boot
 Service and UI. It does not ship the earlier standalone uPyStore prototype.
-The development AppStore version is **1.5.3**. The original organization base
-was `8484908a5ceade80a7a5854925b85d662a3b480b`; it is now synchronized with
-official main `2a6cd97a` without changing the AppStore payload. This is a fork
-build, not an upstream-published AppStore release.
+The development AppStore version is **1.5.4**. The organization integration has
+merged official main `fbfa13a4`. This is a review build, not an
+upstream-published AppStore release. PR #410 remains closed by its author;
+the standards review is not an upstream acceptance or a new PR submission.
 
 ## Preserved behavior
 
@@ -17,7 +18,7 @@ build, not an upstream-published AppStore release.
   Open, Uninstall and Update actions.
 - Sequential Update All, the boot update service and update notifications.
 - Icon, work-in-progress and notification preferences; the existing QR entry.
-- This project build defaults to uPyStore. BadgeHub remains selectable;
+- BadgeHub remains the official default. Select uPyStore in Store Source;
   existing explicit source preferences are retained.
 
 Store Source and Search Store are added to the existing settings UI. Foreground
@@ -63,6 +64,12 @@ noticed. Receipts prevent automatic updates across a known change of provider.
 - Pausing a detail page cancels its pending icon timer. Destroyed pages release
   widget references; late network results can update data without touching
   destroyed widgets. Installation work may finish safely after leaving its page.
+- On firmware exposing the current asynchronous extractor, the verified archive
+  is staged with the framework's `StreamingUnzip.feed_async` and extent writer.
+  The archive is closed around a storage reservation and reopened at its saved
+  position, matching the upstream defragmentation constraint. The detail page's
+  storage-progress callback is retained and checks foreground state. Older
+  firmware falls back to its existing `AppManager.install_mpk` API.
 
 There is no `/lib/mpos` overlay and no board or global OS source modification.
 Source changes are in `internal_filesystem/builtin/apps/com.micropythonos.appstore`.
@@ -77,10 +84,10 @@ historical and is not deployed alongside this version.
 From the repository root, using host Python:
 
 ```text
-python scripts/package_appstore.py --output-dir tmp/appstore-builtin-release --revision 3
+python scripts/package_appstore.py --output-dir tmp/appstore-standards-release --revision 4
 ```
 
-The script writes `com.micropythonos.appstore_r3.mpk` and `release.json`, including
+The script writes `com.micropythonos.appstore_r4.mpk` and `release.json`, including
 package and per-file SHA256 values. The local revision is not a store publication.
 It preserves the official flat app layout and packages only this builtin app.
 
@@ -90,7 +97,7 @@ do not repeatedly interrupt it with raw-REPL attach commands. In the running REP
 
 ```python
 from mpos import AppManager
-AppManager.install_mpk('/data/com.micropythonos.appstore_r3.mpk',
+AppManager.install_mpk('/data/com.micropythonos.appstore_r4.mpk',
                        '/apps/com.micropythonos.appstore')
 import machine
 machine.reset()
@@ -105,9 +112,10 @@ to search for `CC Skill Smoke`, save, and return to the list. Install, Open,
 calculate `2 + 3 = 5`, return and Uninstall.
 Check installation and launch separately. Never copy this app into `/lib`.
 
-This organization build uses uPyStore when no valid source preference is saved.
-Select BadgeHub explicitly to use the original backend. This does not change
-the default in the official upstream repository or claim upstream acceptance.
+Existing explicit uPyStore choices stay selected. Fresh configurations and
+invalid stored source values use BadgeHub, matching the official default.
+Earlier unpublished project builds used an implicit uPyStore default; if such
+a build never saved a choice, select uPyStore once in Settings after upgrading.
 
 ## Regression commands
 
