@@ -80,5 +80,9 @@ The auxiliary stale API index findings remain documented in the November 23
 record; they are not represented as a passing gate. Official interfaces were
 checked against current source and actual native runtime regressions.
 
-PR submission and upstream merge are separate milestones. No upstream merge is
-claimed by this report; the new PR URL will be recorded after submission.
+Official PR submitted by yangcong-bit from the organization branch:
+https://github.com/MicroPythonOS/MicroPythonOS/pull/415
+
+The PR is open and has not been merged. The author-closed #410 remains closed.
+PR submission and upstream merge are separate milestones; CI and maintainer
+review continue on the PR page.
