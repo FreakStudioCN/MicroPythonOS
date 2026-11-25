@@ -1,0 +1,47 @@
+{
+  "total": 132,
+  "all_passed": true,
+  "suites": [
+    {
+      "suite": "test_appstore_async_refresh.py",
+      "cases": 23,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_builtin_source.py",
+      "cases": 9,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_install_safety.py",
+      "cases": 12,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_list_build.py",
+      "cases": 3,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_owner_lifecycle.py",
+      "cases": 5,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_ratings.py",
+      "cases": 15,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_uninstall_refresh.py",
+      "cases": 3,
+      "passed": true
+    },
+    {
+      "suite": "test_appstore_update_flow.py",
+      "cases": 62,
+      "passed": true
+    }
+  ],
+  "initial_environment_failure": "apps directory absent in isolated export; created standard directory and reran only uninstall suite; initial results.json retains failed attempt"
+}
