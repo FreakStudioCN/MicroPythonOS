@@ -6,7 +6,7 @@ Only CHANGELOG conflicted; the future AppStore entry and official release notes
 were retained. The latest upstream follow-up touches only Duke3D and does not
 change the tested AppStore, framework or tests.
 
-The upstream branch has **two focused commits, 22 changed files**: AppStore code,
+At original submission the upstream branch had **two focused commits, 22 changed files**: AppStore code,
 regressions, reproducible test/package tools, fixtures and one usage document.
 Historical reports, duplicate screenshots, logs and internal delivery notes are
 not in that diff. They remain on the organization integration branch.
@@ -86,3 +86,34 @@ https://github.com/MicroPythonOS/MicroPythonOS/pull/415
 The PR is open and has not been merged. The author-closed #410 remains closed.
 PR submission and upstream merge are separate milestones; CI and maintainer
 review continue on the PR page.
+
+
+## CI follow-up: install-button regression
+
+The original full CI run exposed a missed graphical suite:
+`test_graphical_appstore_install_button.py`, specifically
+`test_no_download_url_ignores_click`. Linux x64/arm64 and macOS Intel/arm64 all
+reported the same missing `MockDetail.fetch_and_set_app_details` error; each
+failed 1 of 227 test files. This was an implementation/test-contract mismatch
+in this integration, not a completed full-CI result.
+
+Fix on the organization PR branch:
+https://github.com/FreakStudioCN/MicroPythonOS/commit/30a269018b9300db82a28378620859edfc3ba5a5
+
+Missing URLs keep the original no-op behavior unless a detail request has
+actually failed. Failed details remain retryable, while an in-progress detail
+request is not queued again. The original assertion is preserved. Two cases
+cover retry-after-failure and no duplicate request while loading, and the
+graphical install-button suite is now part of the default focused native runner.
+
+Red-before/green-after verification reproduced the original error and the new
+loading-state failure before the fix. Afterwards **28 graphical install-button
+cases**, **160 native cases in total**, **45 CPython cases**, project lint,
+MicroPython syntax and PR-scope whitespace checks passed.
+
+[Red/green and host regression logs](assets/appstore-upstream-20261125/ci-fix-evidence.zip)
+
+The updated PR now has three commits and 23 changed files. New official CI has
+started; lint passed, and the remaining jobs were still running when checked.
+The earlier 21 physical-device checks and MPK hash describe the pre-fix payload.
+No new physical deployment or manual confirmation is claimed for this follow-up.
